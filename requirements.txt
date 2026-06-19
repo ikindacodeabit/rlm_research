@@ -1,0 +1,4 @@
+openai>=1.40
+datasets>=2.20
+huggingface_hub
+tiktoken>=0.7  # optional: token-accurate RLM memory budgeting (falls back to len//4 if absent)
