@@ -25,7 +25,8 @@ MODEL=Qwen/Qwen3-8B
 
 # --- start vLLM server on this node's GPU ---
 vllm serve "$MODEL" --served-model-name "$MODEL" --port 8000 --max-model-len 32768 \
-  --gpu-memory-utilization 0.90 --enforce-eager -O0 > logs/vllm.$SLURM_JOB_ID.log 2>&1 &
+  --reasoning-parser qwen3 \
+  --gpu-memory-utilization 0.90  > logs/vllm.$SLURM_JOB_ID.log 2>&1 &
 VLLM_PID=$!
 trap "kill $VLLM_PID 2>/dev/null || true" EXIT
 
@@ -45,12 +46,11 @@ for TASK in niah multikey longbench_v2; do
   for MODE in vanilla rlm; do
     echo "=== $(date '+%F %T') :: $TASK / $MODE ==="
     python benchmarks/run_benchmark.py \
-      --task "$TASK" --mode "$MODE" --limit 50 \
+      --task "$TASK" --mode "$MODE" --limit 20 \
       --base-url http://localhost:8000/v1 \
       --root-model "$MODEL" --sub-model "$MODEL" \
-      --no-think \
       --rpm 600 \
-      --max-steps 20 \
+      --max-steps 10 \
       --vanilla-char-limit 120000 \
       --out results \
       || echo "WARN: $TASK/$MODE failed, continuing"
