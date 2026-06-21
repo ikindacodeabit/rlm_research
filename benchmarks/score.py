@@ -10,9 +10,10 @@ from pathlib import Path
 def main(results_dir: str = "results") -> None:
     rows = defaultdict(lambda: {"n": 0, "correct": 0, "tokens": 0, "latency": 0.0,
                                 "unfinished": 0, "errors": 0})
-    for path in sorted(Path(results_dir).glob("*.jsonl")):
+    for path in sorted(Path(results_dir).rglob("*.jsonl")):
+        variant = path.parent.name if path.parent != Path(results_dir) else "root"
         task, mode, model = path.stem.split(".", 2)
-        key = (task, mode, model)
+        key = (f"{task}__{variant}", mode, model)
         for line in open(path):
             r = json.loads(line)
             row = rows[key]
