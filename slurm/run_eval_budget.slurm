@@ -21,6 +21,11 @@ cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs results
 
 source ~/venvs/rlm/bin/activate
+export PYTHONUNBUFFERED=1                # flush python stdout per line so the .out tracks
+                                        # progress live (non-TTY stdout is block-buffered,
+                                        # so per-item lines/summaries otherwise only appear
+                                        # when each cell's process exits — and are lost if
+                                        # it's killed/requeued mid-cell)
 export RLM_DATA_DIR="${RLM_DATA_DIR:-$HOME/rlm_data}"
 export HF_HOME="$HOME/hf_cache"
 export HF_HUB_OFFLINE=1                 # never try the internet
@@ -53,8 +58,13 @@ echo "vLLM up."
 # Results separated per (thinking, budget) so score.py reports each as its own
 # variant row: results/<think>_b<budget>/{task}.rlm.{slug}.jsonl. APPEND-mode
 # checkpointing makes the whole sweep resumable on requeue.
-BUDGETS="2048 4096 8192 16384 32768"
-for THINK in nothink think; do
+# Both selectable via env so the two halves can run as separate jobs in
+# parallel (they write to disjoint dirs: nothink_b*/ vs think_b*/), e.g.
+#   sbatch --export=ALL,THINK_MODES=think   slurm/run_eval_budget.slurm
+#   sbatch --export=ALL,THINK_MODES=nothink slurm/run_eval_budget.slurm
+BUDGETS="${BUDGETS:-2048 4096 8192 16384 32768}"
+THINK_MODES="${THINK_MODES:-nothink think}"
+for THINK in $THINK_MODES; do
   if [ "$THINK" = nothink ]; then THINK_FLAG="--no-think"; else THINK_FLAG=""; fi
   for BUDGET in $BUDGETS; do
     OUTDIR="results/${THINK}_b${BUDGET}"
