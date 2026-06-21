@@ -50,14 +50,11 @@ def main() -> None:
     ap.add_argument("--max-steps", type=int, default=12)
     ap.add_argument("--vanilla-char-limit", type=int, default=400_000)
     # --- RLM memory-budget knobs (no budget unless --max-context-tokens is set) ---
+    # Eviction-only: out-of-budget turns are simply dropped (no notes/summarization).
     ap.add_argument("--max-context-tokens", type=int, default=None,
                     help="cap the RLM root's context window (tokens); unset = unbounded (legacy)")
     ap.add_argument("--keep-recent-turns", type=int, default=3,
                     help="recent (assistant,observation) pairs to keep verbatim under budget")
-    ap.add_argument("--fold-strategy", default="evict", choices=["evict", "summarize"],
-                    help="how to fold out-of-budget turns: drop them or summarize into notes")
-    ap.add_argument("--max-notes-tokens", type=int, default=1024,
-                    help="cap on the persistent notes scratchpad injected into context")
     ap.add_argument("--out", default="results")
     ap.add_argument("--debug", action="store_true",
                     help="print every RLM step (model reply, code, REPL output) live")
@@ -79,8 +76,6 @@ def main() -> None:
         budget = MemoryBudget(
             max_context_tokens=args.max_context_tokens,
             keep_recent_turns=args.keep_recent_turns,
-            strategy=args.fold_strategy,
-            max_notes_tokens=args.max_notes_tokens,
         )
     rlm = RLM(root_client=root, sub_client=sub, max_steps=args.max_steps, budget=budget)
 

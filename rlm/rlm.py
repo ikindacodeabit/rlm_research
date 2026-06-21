@@ -1,30 +1,16 @@
-"""Recursive Language Model (RLM) with a configurable MEMORY BUDGET.
+"""Recursive Language Model (RLM) with a configurable MEMORY BUDGET (eviction-only).
 
 This is a drop-in successor to the minimal scaffold. The paradigm is unchanged
 (Zhang, Kraska & Khattab, 2025): the long prompt is NOT placed in the model's
 context window; it lives as a string `context` in a persistent REPL, and the
 root LM writes code to inspect it / recurse via `llm_query`.
 
-What v6 adds
-------------
-1. MemoryBudget: a hard cap on the ROOT model's context window (in tokens),
-   independent of document length. The full document never enters context;
-   what grows in the minimal scaffold is the transcript of REPL observations.
-   v6 keeps the full transcript server-side but only ever SENDS the root a
-   bounded view:
-
-       system + begin + [persistent NOTES] + last K turns that fit the budget
-
-   Older turns are "folded" out of context by one of two strategies:
-     * "evict"     - dropped cheaply (model must have saved what it needs via note())
-     * "summarize" - a sub-LLM compresses them into the NOTES scratchpad first
-
-2. note(text): a persistent scratchpad tool. Notes survive folding, so the model
-   can carry evidence across evictions even under a tiny budget.
-
-3. Efficiency: token-accurate accounting (tiktoken when available), sub-call
-   memoization, adaptive observation truncation, and per-run efficiency metrics
-   returned on RLMResult.metrics for budget sweeps.
+MemoryBudget caps the ROOT model's context window (in tokens), independent of
+document length. The full transcript is kept server-side, but the root only ever
+SEES a bounded view: system + begin + the most-recent turns that fit the budget.
+Older turns are simply DROPPED (evicted) — there is no scratchpad and no
+summarization. Because REPL variables persist across turns, the model can always
+recompute or re-fetch anything an evicted turn produced.
 
 Grounding note: the anti-hallucination guard (FINAL literal must appear in real
 output) checks a SEPARATE server-side `seen_output` accumulator, which is never
@@ -34,6 +20,7 @@ NOTE: model-generated code is executed with `exec`. On a shared cluster, run thi
 inside your own user account / a SLURM job only. For stricter isolation, wrap the
 REPL in a separate process or container.
 """
+
 from __future__ import annotations
 
 import ast
@@ -66,7 +53,6 @@ RULES:
       prompt, e.g. llm_query("Answer X based on this text:\\n" + context[i:j])
       (keep each call under ~8000 characters). Capture the result:
       ans = llm_query(...) then print(ans).
-    * `note(text: str)`: save a SHORT finding to a persistent scratchpad. {note_help}
     * `print(...)`: anything you print is shown back to you in the NEXT message
       (truncated to {obs_limit} chars), so print only what you need to see.
 - Strategy: peek at structure first (e.g. `print(context[:2000])`,
@@ -92,7 +78,6 @@ Example of a correct session (3 turns):
   REPL: ...The invoice total for March was $4,210 including tax...
   You:  ```python
         ans = llm_query("What was the March invoice total? Answer from this text:\\n" + context[idx-200:idx+500])
-        note("March invoice total = " + ans)
         print(ans)
         ```
   REPL: $4,210
@@ -109,22 +94,20 @@ SUB_SYSTEM_PROMPT = (
     "provided in the prompt. Be concise and factual."
 )
 
-SUMMARIZE_SYSTEM_PROMPT = (
-    "You compress an AI agent's prior REPL findings into a few terse bullet "
-    "points. Keep concrete facts, numbers, quotes, indices, and partial answers "
-    "verbatim. Drop chatter. Output <= 6 short lines."
-)
-
-NOTES_TEMPLATE = (
+FOLD_MARKER = (
     "[MEMORY NOTICE] {n} earlier turn(s) were dropped to stay within your memory "
-    "budget. This persistent scratchpad is everything you saved/derived before:\n"
-    "{notes}\n[END SCRATCHPAD] Continue from the recent REPL output below."
+    "budget. They are gone from your context and were NOT saved anywhere — but the "
+    "REPL is persistent, so any Python variable you assigned still exists. Re-query "
+    "the REPL if you need anything from those turns. Continue from the recent output "
+    "below."
 )
 
 CODE_RE = re.compile(r"```(?:python|repl|py)?[ \t]*\n?(.*?)```", re.DOTALL)
-STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|note|FINAL_VAR|FINAL"
+STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|FINAL_VAR|FINAL"
 ONELINE_FIX_RE = re.compile(rf"(?<=[\)\w'\"])\s+(?=(?:{STMT_KEYWORDS})\b)")
-TEXT_FINAL_RE = re.compile(r"FINAL\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL)
+TEXT_FINAL_RE = re.compile(
+    r"FINAL\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL
+)
 TEXT_FINAL_VAR_RE = re.compile(r"FINAL_VAR\(\s*[\"'](\w+)[\"']\s*\)")
 
 
@@ -140,6 +123,7 @@ class TokenCounter:
         if fn is None:
             try:  # pragma: no cover - depends on environment
                 import tiktoken
+
                 self._enc = tiktoken.get_encoding("cl100k_base")
             except Exception:
                 self._enc = None
@@ -164,24 +148,19 @@ class TokenCounter:
 # --------------------------------------------------------------------------- #
 @dataclass
 class MemoryBudget:
-    """Caps the ROOT model's context window.
+    """Caps the ROOT model's context window (eviction-only).
 
-    max_context_tokens : hard cap on the root prompt (system + begin + notes +
-                         recent turns). The headline knob to sweep.
+    max_context_tokens : hard cap on the root prompt (system + begin + recent
+                         turns). The headline knob to sweep.
     keep_recent_turns  : how many most-recent (assistant,observation) pairs to
                          try to keep verbatim before budget squeezing kicks in.
-    strategy           : "evict" (drop folded turns) or "summarize" (compress
-                         folded turns into the NOTES scratchpad via a sub-LLM).
-    max_notes_tokens   : cap on the scratchpad size injected into context.
+
+    Older turns that don't fit are simply DROPPED (evicted) — nothing is saved or
+    summarized. The model must keep what it needs in persistent REPL variables.
     """
+
     max_context_tokens: int = 4096
     keep_recent_turns: int = 3
-    strategy: str = "evict"  # "evict" | "summarize"
-    max_notes_tokens: int = 1024
-
-    def __post_init__(self):
-        if self.strategy not in ("evict", "summarize"):
-            raise ValueError(f"strategy must be 'evict' or 'summarize', got {self.strategy!r}")
 
 
 @dataclass
@@ -216,7 +195,7 @@ class RLM:
         self.tok = TokenCounter(token_counter)
 
     # ---------------- REPL plumbing ----------------
-    def _make_env(self, context: str, metrics: dict, notes: list, cache: dict) -> dict:
+    def _make_env(self, context: str, metrics: dict, cache: dict) -> dict:
         final_box: dict = {"value": None, "done": False}
 
         def llm_query(prompt: str) -> str:
@@ -236,13 +215,6 @@ class RLM:
                 cache[prompt] = ans
             return ans
 
-        def note(text: str) -> str:
-            text = str(text).strip()
-            if text:
-                notes.append(text)
-                metrics["notes_saved"] += 1
-            return f"[saved note #{len(notes)}]"
-
         def FINAL(answer) -> None:
             final_box["value"] = str(answer)
             final_box["done"] = True
@@ -250,7 +222,6 @@ class RLM:
         env = {
             "context": context,
             "llm_query": llm_query,
-            "note": note,
             "FINAL": FINAL,
             "re": re,
         }
@@ -274,12 +245,16 @@ class RLM:
                 try:
                     compile(fixed, "<rlm>", "exec")
                     code = fixed
-                    note = ("\n[note: your code block was written on a single line; it was "
-                            "auto-reformatted. Please use real newlines inside code blocks.]")
+                    note = (
+                        "\n[note: your code block was written on a single line; it was "
+                        "auto-reformatted. Please use real newlines inside code blocks.]"
+                    )
                 except SyntaxError:
-                    return ("[SYNTAX ERROR] Your code block was written on a single line and "
-                            "could not be parsed. Rewrite it as a properly formatted multi-line "
-                            "```python block with real newlines.")
+                    return (
+                        "[SYNTAX ERROR] Your code block was written on a single line and "
+                        "could not be parsed. Rewrite it as a properly formatted multi-line "
+                        "```python block with real newlines."
+                    )
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
@@ -290,11 +265,13 @@ class RLM:
                 literals = []
                 if tree:
                     for node in ast.walk(tree):
-                        if (isinstance(node, ast.Call)
-                                and isinstance(node.func, ast.Name)
-                                and node.func.id == "FINAL"
-                                and node.args
-                                and isinstance(node.args[0], ast.Constant)):
+                        if (
+                            isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Name)
+                            and node.func.id == "FINAL"
+                            and node.args
+                            and isinstance(node.args[0], ast.Constant)
+                        ):
                             literals.append(str(node.args[0].value))
                 env["_rlm_final_literals"] = literals
                 if tree and tree.body and isinstance(tree.body[-1], ast.Expr):
@@ -319,7 +296,11 @@ class RLM:
         out = buf.getvalue()
         if len(out) > obs_limit:
             half = obs_limit // 2
-            out = out[:half] + f"\n...[truncated {len(out) - obs_limit} chars]...\n" + out[-half:]
+            out = (
+                out[:half]
+                + f"\n...[truncated {len(out) - obs_limit} chars]...\n"
+                + out[-half:]
+            )
         return (out if out.strip() else "[no output]") + note
 
     # ---------------- budget / context view ----------------
@@ -328,48 +309,12 @@ class RLM:
             return ""
         return (
             f"\n- MEMORY BUDGET: your working context is capped at ~{self.budget.max_context_tokens} "
-            "tokens. Older turns are DROPPED automatically once you exceed it. Anything you will "
-            "need for FINAL must be saved with note('...') BEFORE it scrolls out — the scratchpad "
-            "survives, raw REPL output does not."
+            "tokens. Once you exceed it, your OLDEST turns are DROPPED automatically and are gone "
+            "for good — they are not saved or summarized anywhere. Raw REPL output that scrolls out "
+            "vanishes, but Python VARIABLES in the REPL persist across turns. So store anything you "
+            "will need for FINAL in a variable (or be ready to recompute it); never rely on old "
+            "output staying visible."
         )
-
-    def _note_help(self) -> str:
-        if self.budget is None:
-            return "Use it to keep a running list of key findings."
-        return ("Notes PERSIST across memory-budget drops, so save every fact you'll need for the "
-                "final answer here.")
-
-    def _notes_block(self, notes: list) -> str:
-        text = "\n".join(f"- {n}" for n in notes) if notes else "(nothing saved yet)"
-        # keep the scratchpad itself within its sub-budget
-        if self.budget is not None:
-            cap = self.budget.max_notes_tokens
-            while self.tok.count(text) > cap and len(text) > 200:
-                text = text[: int(len(text) * 0.8)] + "\n- ...[notes truncated]"
-        return text
-
-    def _summarize_pairs(self, pairs: list, env, metrics: dict, notes: list) -> None:
-        """Compress folded (assistant,observation) pairs into the scratchpad."""
-        blob = []
-        for pair in pairs:
-            for m in pair:
-                if m["role"] == "user":  # the observation carries the facts
-                    blob.append(m["content"])
-        joined = "\n".join(blob)[: self.max_subcall_chars]
-        if not joined.strip():
-            return
-        try:
-            summary = self.sub.chat(
-                [
-                    {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
-                    {"role": "user", "content": "Compress these prior findings:\n" + joined},
-                ]
-            )
-            metrics["summarize_calls"] += 1
-            metrics["sub_call_tokens"] += self.tok.count(joined) + self.tok.count(summary)
-            notes.append("(auto) " + summary.strip())
-        except Exception:
-            pass
 
     # ---------------- main loop ----------------
     def run(self, context: str, task: str) -> RLMResult:
@@ -381,15 +326,11 @@ class RLM:
             "sub_calls": 0,
             "sub_call_tokens": 0,
             "sub_cache_hits": 0,
-            "compactions": 0,
-            "summarize_calls": 0,
-            "notes_saved": 0,
+            "evictions": 0,
             "budget": (self.budget.max_context_tokens if self.budget else None),
-            "strategy": (self.budget.strategy if self.budget else None),
         }
-        notes: list = []
         cache: dict = {}
-        env = self._make_env(context, metrics, notes, cache)
+        env = self._make_env(context, metrics, cache)
 
         system_msg = {
             "role": "system",
@@ -399,35 +340,34 @@ class RLM:
                 max_steps=self.max_steps,
                 task=task,
                 budget_note=self._budget_note(),
-                note_help=self._note_help(),
             ),
         }
         begin_msg = {"role": "user", "content": "Begin. Write your first code block."}
 
-        full_history: list = []   # all (assistant, user) messages, server-side
-        summary_index = 0         # number of leading pairs already folded into notes
+        full_history: list = []  # all (assistant, user) messages, server-side
+        evicted_count = 0  # number of leading pairs already dropped (evicted)
         transcript = []
         nudges = 0
-        seen_output = ""          # grounding accumulator — NEVER compacted
+        seen_output = ""  # grounding accumulator — NEVER compacted
 
         def build_sent() -> tuple[list, int]:
             """Construct the bounded view actually sent to the root model."""
-            nonlocal summary_index
+            nonlocal evicted_count
             base = [system_msg, begin_msg]
             if self.budget is None:
                 return base + full_history, 0
 
             n_pairs = len(full_history) // 2
-            pairs = [full_history[i * 2:i * 2 + 2] for i in range(n_pairs)]
+            pairs = [full_history[i * 2 : i * 2 + 2] for i in range(n_pairs)]
             keep = self.budget.keep_recent_turns
             kept = pairs[-keep:] if keep > 0 else []
 
             def assemble(kept_pairs, fold_n):
                 msgs = list(base)
-                if fold_n > 0 or notes:
-                    msgs.append({"role": "user",
-                                 "content": NOTES_TEMPLATE.format(n=fold_n,
-                                                                  notes=self._notes_block(notes))})
+                if fold_n > 0:
+                    msgs.append(
+                        {"role": "user", "content": FOLD_MARKER.format(n=fold_n)}
+                    )
                 for p in kept_pairs:
                     msgs.extend(p)
                 return msgs
@@ -435,19 +375,17 @@ class RLM:
             fold_n = n_pairs - len(kept)
             sent = assemble(kept, fold_n)
             # squeeze: drop more recent pairs until within budget
-            while self.tok.count_messages(sent) > self.budget.max_context_tokens and kept:
+            while (
+                self.tok.count_messages(sent) > self.budget.max_context_tokens and kept
+            ):
                 kept = kept[1:]
                 fold_n = n_pairs - len(kept)
                 sent = assemble(kept, fold_n)
 
-            # fold newly-dropped pairs (summarize or just evict)
-            if fold_n > summary_index:
-                newly = pairs[summary_index:fold_n]
-                if self.budget.strategy == "summarize":
-                    self._summarize_pairs(newly, env, metrics, notes)
-                summary_index = fold_n
-                metrics["compactions"] += 1
-                sent = assemble(kept, fold_n)  # rebuild (notes may have grown)
+            # record newly-evicted pairs (dropped for good)
+            if fold_n > evicted_count:
+                evicted_count = fold_n
+                metrics["evictions"] += 1
             return sent, fold_n
 
         for step in range(1, self.max_steps + 1):
@@ -455,7 +393,9 @@ class RLM:
             sent, _ = build_sent()
             ctx_tokens = self.tok.count_messages(sent)
             metrics["root_prompt_tokens"] += ctx_tokens
-            metrics["peak_context_tokens"] = max(metrics["peak_context_tokens"], ctx_tokens)
+            metrics["peak_context_tokens"] = max(
+                metrics["peak_context_tokens"], ctx_tokens
+            )
 
             reply = self.root.chat(sent)
             metrics["root_completion_tokens"] += self.tok.count(reply)
@@ -464,7 +404,9 @@ class RLM:
             # adaptive observation limit: never let one observation exceed the budget
             obs_limit = self.obs_limit
             if self.budget is not None:
-                obs_limit = max(512, min(self.obs_limit, self.budget.max_context_tokens * 3))
+                obs_limit = max(
+                    512, min(self.obs_limit, self.budget.max_context_tokens * 3)
+                )
 
             # --- No code block in the reply ---
             if not blocks:
@@ -472,81 +414,145 @@ class RLM:
                 if m:
                     val = m.group(1).strip()
                     if val and (val in seen_output or val in task):
-                        transcript.append({"step": step, "reply": reply, "code": None,
-                                           "observation": "[FINAL parsed from prose]"})
-                        return RLMResult(val, step, True, transcript, "final_in_prose", metrics)
+                        transcript.append(
+                            {
+                                "step": step,
+                                "reply": reply,
+                                "code": None,
+                                "observation": "[FINAL parsed from prose]",
+                            }
+                        )
+                        return RLMResult(
+                            val, step, True, transcript, "final_in_prose", metrics
+                        )
                     nudges += 1
-                    transcript.append({"step": step, "reply": reply, "code": None,
-                                       "observation": "[ungrounded prose FINAL rejected]"})
+                    transcript.append(
+                        {
+                            "step": step,
+                            "reply": reply,
+                            "code": None,
+                            "observation": "[ungrounded prose FINAL rejected]",
+                        }
+                    )
                     if nudges > 2:
-                        return RLMResult(None, step, False, transcript, "ungrounded_final", metrics)
+                        return RLMResult(
+                            None, step, False, transcript, "ungrounded_final", metrics
+                        )
                     full_history.append({"role": "assistant", "content": reply})
-                    full_history.append({"role": "user", "content":
-                        f"REJECTED: your answer {val!r} never appeared in any actual REPL "
-                        "output, so it looks like a guess. Do NOT invent answers. Write a "
-                        "```python code block that finds the answer in `context` (string "
-                        "search / regex / llm_query with the snippet pasted in), look at "
-                        "the real output, and only then FINAL it."})
+                    full_history.append(
+                        {
+                            "role": "user",
+                            "content": f"REJECTED: your answer {val!r} never appeared in any actual REPL "
+                            "output, so it looks like a guess. Do NOT invent answers. Write a "
+                            "```python code block that finds the answer in `context` (string "
+                            "search / regex / llm_query with the snippet pasted in), look at "
+                            "the real output, and only then FINAL it.",
+                        }
+                    )
                     continue
                 mv = TEXT_FINAL_VAR_RE.search(reply)
                 if mv:
                     val = str(env.get(mv.group(1), f"<missing var {mv.group(1)}>"))
-                    transcript.append({"step": step, "reply": reply, "code": None,
-                                       "observation": "[FINAL_VAR parsed from prose]"})
-                    return RLMResult(val, step, True, transcript, "final_var_in_prose", metrics)
+                    transcript.append(
+                        {
+                            "step": step,
+                            "reply": reply,
+                            "code": None,
+                            "observation": "[FINAL_VAR parsed from prose]",
+                        }
+                    )
+                    return RLMResult(
+                        val, step, True, transcript, "final_var_in_prose", metrics
+                    )
                 nudges += 1
-                transcript.append({"step": step, "reply": reply, "code": None,
-                                   "observation": "[no code block - nudged]"})
+                transcript.append(
+                    {
+                        "step": step,
+                        "reply": reply,
+                        "code": None,
+                        "observation": "[no code block - nudged]",
+                    }
+                )
                 if nudges > 2:
-                    return RLMResult(reply.strip(), step, False, transcript, "gave_up_no_code", metrics)
+                    return RLMResult(
+                        reply.strip(),
+                        step,
+                        False,
+                        transcript,
+                        "gave_up_no_code",
+                        metrics,
+                    )
                 full_history.append({"role": "assistant", "content": reply})
-                full_history.append({"role": "user", "content":
-                    "Your reply contained no code block, so NOTHING was executed and no "
-                    "answer was recorded. Reply with exactly one ```python code block. "
-                    "If you already know the answer from a previous REPL output, reply with "
-                    "a code block containing only: FINAL(\"your answer\")"})
+                full_history.append(
+                    {
+                        "role": "user",
+                        "content": "Your reply contained no code block, so NOTHING was executed and no "
+                        "answer was recorded. Reply with exactly one ```python code block. "
+                        "If you already know the answer from a previous REPL output, reply with "
+                        'a code block containing only: FINAL("your answer")',
+                    }
+                )
                 continue
 
             # --- Execute ONLY the first block ---
             code = blocks[0]
             obs = self._exec(code, env, obs_limit)
             if len(blocks) > 1:
-                obs += ("\n[WARNING: you wrote multiple code blocks; ONLY the FIRST was "
-                        "executed. Anything you wrote after it (including any 'output' you "
-                        "predicted) did NOT happen.)")
-            transcript.append({"step": step, "reply": reply, "code": code, "observation": obs})
+                obs += (
+                    "\n[WARNING: you wrote multiple code blocks; ONLY the FIRST was "
+                    "executed. Anything you wrote after it (including any 'output' you "
+                    "predicted) did NOT happen.)"
+                )
+            transcript.append(
+                {"step": step, "reply": reply, "code": code, "observation": obs}
+            )
             seen_output += "\n" + obs
 
             if env["_final_box"]["done"]:
                 val = env["_final_box"]["value"]
-                if (val in (env.get("_rlm_final_literals") or [])
-                        and val not in seen_output and val not in task):
+                if (
+                    val in (env.get("_rlm_final_literals") or [])
+                    and val not in seen_output
+                    and val not in task
+                ):
                     env["_final_box"]["done"] = False
                     env["_final_box"]["value"] = None
                     nudges += 1
                     if nudges > 2:
-                        return RLMResult(None, step, False, transcript, "ungrounded_final", metrics)
+                        return RLMResult(
+                            None, step, False, transcript, "ungrounded_final", metrics
+                        )
                     full_history.append({"role": "assistant", "content": reply})
-                    full_history.append({"role": "user", "content":
-                        f"REJECTED: FINAL({val!r}) is a literal constant that never appeared "
-                        "in any REPL output — it looks like a guess. Find the real answer in "
-                        "`context` first (e.g. re.search / context.find / llm_query with the "
-                        "snippet pasted in), print it, then call FINAL on the variable "
-                        "holding it."})
+                    full_history.append(
+                        {
+                            "role": "user",
+                            "content": f"REJECTED: FINAL({val!r}) is a literal constant that never appeared "
+                            "in any REPL output — it looks like a guess. Find the real answer in "
+                            "`context` first (e.g. re.search / context.find / llm_query with the "
+                            "snippet pasted in), print it, then call FINAL on the variable "
+                            "holding it.",
+                        }
+                    )
                     continue
                 return RLMResult(val, step, True, transcript, "final_called", metrics)
 
             full_history.append({"role": "assistant", "content": reply})
-            full_history.append({"role": "user", "content":
-                f"ACTUAL REPL output:\n```\n{obs}\n```\n"
-                f"Continue. ({self.max_steps - step} turns left) "
-                "Remember: one code block only; finish with FINAL(...) once you have "
-                "seen the answer in a real output."})
+            full_history.append(
+                {
+                    "role": "user",
+                    "content": f"ACTUAL REPL output:\n```\n{obs}\n```\n"
+                    f"Continue. ({self.max_steps - step} turns left) "
+                    "Remember: one code block only; finish with FINAL(...) once you have "
+                    "seen the answer in a real output.",
+                }
+            )
 
         return RLMResult(None, self.max_steps, False, transcript, "max_steps", metrics)
 
 
-def vanilla_answer(client: NIMClient, context: str, task: str, char_limit: int = 400_000) -> str:
+def vanilla_answer(
+    client: NIMClient, context: str, task: str, char_limit: int = 400_000
+) -> str:
     """Baseline: stuff (possibly truncated) context directly into the prompt."""
     truncated = context[:char_limit]
     note = "" if len(context) <= char_limit else "\n[NOTE: document truncated]"
