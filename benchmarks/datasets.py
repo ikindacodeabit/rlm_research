@@ -100,10 +100,53 @@ def load_oolong(limit: int | None = None):
             }
 
 
+def load_ruler32k(limit: int | None = None):
+    """RULER at 32k context, read from the JSONL cached by slurm/download_data.sh.
+
+    RULER ships ~13 task SUBSETS (niah_single_*, niah_multikey_*, niah_multivalue,
+    niah_multiquery, vt, cwe, fwe, qa_1, qa_2). Each example is tagged with its
+    `subset` so the runner/scorer can break metrics down per subset.
+
+    `limit` here means PER SUBSET (not a global first-N): we yield up to `limit`
+    examples from every subset, so a single run exercises all of them. The cached
+    rows use a stable schema written by download_data.sh:
+        {"subset", "input", "outputs": [...], "index"}
+    RULER's `input` is the full templated prompt (haystack + the query), so we map
+    it wholesale to `context` and use a fixed question cue — uniform across the
+    heterogeneous task types (vt/cwe/fwe aren't context+question pairs).
+    """
+    path = DATA_DIR / "ruler32k.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} missing — run slurm/download_data.sh on the login node first.")
+    per_subset = limit or 50
+    seen: dict[str, int] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            ex = json.loads(line)
+            subset = ex.get("subset") or ex.get("task") or "unknown"
+            k = seen.get(subset, 0)
+            if k >= per_subset:
+                continue
+            seen[subset] = k + 1
+            outs = ex.get("outputs", ex.get("answers", ex.get("answer", "")))
+            answers = outs if isinstance(outs, list) else [str(outs)]
+            yield {
+                "id": f"ruler32k-{subset}-{k}",
+                "subset": subset,
+                "context": ex["input"],
+                "question": "Answer the query stated in the document above. Reply with the answer only.",
+                "answers": [str(a) for a in answers],
+            }
+
+
 TASKS = {
     "niah": lambda limit: gen_niah(n_examples=limit or 50),
     "niah-1m": lambda limit: gen_niah(n_examples=limit or 20, ctx_chars=1_000_000, seed=7),
     "multikey": lambda limit: gen_multikey(n_examples=limit or 50),
     "longbench_v2": load_longbench_v2,
     "oolong": load_oolong,
+    "ruler32k": load_ruler32k,
 }

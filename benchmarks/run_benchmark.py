@@ -30,6 +30,20 @@ def is_correct(pred: str | None, answers: list[str]) -> bool:
     return any(normalize(a) in p for a in answers)
 
 
+def recall(pred: str | None, answers: list[str]) -> float:
+    """Partial-credit score in [0,1]: fraction of gold answers present in pred.
+
+    For single-answer tasks this is just 0.0/1.0 (== is_correct). For RULER's
+    multi-needle subsets (multivalue/multiquery/cwe/fwe) it gives partial credit,
+    matching RULER's recall metric.
+    """
+    if pred is None or not answers:
+        return 0.0
+    p = normalize(pred)
+    hits = sum(1 for a in answers if normalize(a) in p)
+    return hits / len(answers)
+
+
 def load_done(path: Path) -> set:
     if not path.exists():
         return set()
@@ -96,6 +110,8 @@ def main() -> None:
                 tok0 = root.usage.total_tokens + sub.usage.total_tokens
                 sub0 = sub.usage.calls
                 record = {"id": ex["id"], "mode": mode, "answers": ex["answers"]}
+                if ex.get("subset") is not None:
+                    record["subset"] = ex["subset"]
                 try:
                     if mode == "vanilla":
                         pred = vanilla_answer(root, ex["context"], ex["question"],
@@ -124,7 +140,8 @@ def main() -> None:
                 except Exception as e:
                     record.update(pred=None, error=f"{type(e).__name__}: {e}",
                                   steps=0, finished=False, end_reason="exception")
-                record["correct"] = is_correct(record.get("pred"), ex["answers"])
+                record["score"] = round(recall(record.get("pred"), ex["answers"]), 4)
+                record["correct"] = record["score"] == 1.0
                 record["latency_s"] = round(time.time() - t0, 2)
                 record["tokens"] = root.usage.total_tokens + sub.usage.total_tokens - tok0
                 record["sub_calls"] = sub.usage.calls - sub0
