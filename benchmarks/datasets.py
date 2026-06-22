@@ -100,20 +100,20 @@ def load_oolong(limit: int | None = None):
             }
 
 
-def load_ruler32k(limit: int | None = None):
-    """RULER at 32k context, read from the JSONL cached by slurm/download_data.sh.
+def _load_ruler(name: str, limit: int | None = None):
+    """RULER (xAlg-AI/att-hub-ruler-{16,32}k), read from a JSONL cached by
+    slurm/download_data.sh. `name` is the task stem ("ruler16k" / "ruler32k").
 
-    RULER ships ~13 task SUBSETS (niah_single_*, niah_multikey_*, niah_multivalue,
+    RULER ships 13 task SUBSETS (niah_single_*, niah_multikey_*, niah_multivalue,
     niah_multiquery, vt, cwe, fwe, qa_1, qa_2). Each example is tagged with its
     `subset` so the runner/scorer can break metrics down per subset.
 
     `limit` here means PER SUBSET (not a global first-N): we yield up to `limit`
     examples from every subset, so a single run exercises all of them. The cached
-    rows use a stable schema written by download_data.sh (from xAlg-AI/att-hub-
-    ruler-32k), with proper context/question separation:
+    rows use a stable schema with proper context/question separation:
         {"subset", "context", "question", "answer_prefix", "answers": [...]}
     """
-    path = DATA_DIR / "ruler32k.jsonl"
+    path = DATA_DIR / f"{name}.jsonl"
     if not path.exists():
         raise FileNotFoundError(f"{path} missing — run slurm/download_data.sh on the login node first.")
     per_subset = limit or 50
@@ -134,7 +134,7 @@ def load_ruler32k(limit: int | None = None):
             # question + answer_prefix (e.g. "...is") cues the expected answer format
             q = " ".join(x for x in (ex.get("question", ""), ex.get("answer_prefix", "")) if x).strip()
             yield {
-                "id": f"ruler32k-{subset}-{k}",
+                "id": f"{name}-{subset}-{k}",
                 "subset": subset,
                 "context": ex["context"],
                 "question": q or "Answer the query stated in the document above. Reply with the answer only.",
@@ -148,5 +148,6 @@ TASKS = {
     "multikey": lambda limit: gen_multikey(n_examples=limit or 50),
     "longbench_v2": load_longbench_v2,
     "oolong": load_oolong,
-    "ruler32k": load_ruler32k,
+    "ruler16k": lambda limit: _load_ruler("ruler16k", limit),
+    "ruler32k": lambda limit: _load_ruler("ruler32k", limit),
 }

@@ -49,25 +49,32 @@ curl -s http://localhost:8000/v1/models | head -c 200 || { echo "vLLM failed to 
 echo "vLLM up."
 
 # --- 2x2 grid: thinking on/off x vanilla/rlm, base RLM (no --max-context-tokens) ---
-# Separate dirs per thinking condition (append+skip checkpointing would otherwise
-# collide): think -> results/ruler_think, no-think -> results/ruler_nothink.
-# --limit 50 is PER SUBSET (~13 x 50 examples per cell).
+# Which RULER length to run is selectable; default 16k (fits the window cleanly).
+#   sbatch slurm/run_eval_ruler.slurm                       # ruler16k
+#   sbatch --export=ALL,RULER_TASK=ruler32k slurm/run_eval_ruler.slurm
+# Separate dirs per (task, thinking) so append+skip checkpointing never collides:
+#   results/${RULER_TASK}_{think,nothink}.  --limit 50 is PER SUBSET.
+# --vanilla-char-limit 100000 (~33k tokens worst case) keeps the vanilla prompt
+# inside the 40960 window: a no-op for 16k, and the honest truncation for 32k's
+# dense subsets (cwe runs ~44k tokens, larger than the window). RLM is unaffected
+# either way — it reads `context` from the REPL, never stuffing it in the prompt.
+RULER_TASK="${RULER_TASK:-ruler16k}"
 LIMIT="${LIMIT:-50}"
 for THINK in nothink think; do
   if [ "$THINK" = nothink ]; then THINK_FLAG="--no-think"; else THINK_FLAG=""; fi
-  OUTDIR="results/ruler_$THINK"
+  OUTDIR="results/${RULER_TASK}_$THINK"
   for MODE in vanilla rlm; do
-    echo "=== $(date '+%F %T') :: ruler32k / $MODE / $THINK (limit=$LIMIT per subset) ==="
+    echo "=== $(date '+%F %T') :: $RULER_TASK / $MODE / $THINK (limit=$LIMIT per subset) ==="
     python benchmarks/run_benchmark.py \
-      --task ruler32k --mode "$MODE" --limit "$LIMIT" \
+      --task "$RULER_TASK" --mode "$MODE" --limit "$LIMIT" \
       --base-url http://localhost:8000/v1 \
       --root-model "$MODEL" --sub-model "$MODEL" \
       $THINK_FLAG \
       --rpm 600 \
       --max-steps 50 \
-      --vanilla-char-limit 200000 \
+      --vanilla-char-limit 100000 \
       --out "$OUTDIR" \
-      || echo "WARN: ruler32k/$MODE/$THINK failed, continuing"
+      || echo "WARN: $RULER_TASK/$MODE/$THINK failed, continuing"
   done
 done
 echo "=== done ==="
