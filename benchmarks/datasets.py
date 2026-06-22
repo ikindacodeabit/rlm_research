@@ -109,11 +109,9 @@ def load_ruler32k(limit: int | None = None):
 
     `limit` here means PER SUBSET (not a global first-N): we yield up to `limit`
     examples from every subset, so a single run exercises all of them. The cached
-    rows use a stable schema written by download_data.sh:
-        {"subset", "input", "outputs": [...], "index"}
-    RULER's `input` is the full templated prompt (haystack + the query), so we map
-    it wholesale to `context` and use a fixed question cue — uniform across the
-    heterogeneous task types (vt/cwe/fwe aren't context+question pairs).
+    rows use a stable schema written by download_data.sh (from xAlg-AI/att-hub-
+    ruler-32k), with proper context/question separation:
+        {"subset", "context", "question", "answer_prefix", "answers": [...]}
     """
     path = DATA_DIR / "ruler32k.jsonl"
     if not path.exists():
@@ -131,13 +129,15 @@ def load_ruler32k(limit: int | None = None):
             if k >= per_subset:
                 continue
             seen[subset] = k + 1
-            outs = ex.get("outputs", ex.get("answers", ex.get("answer", "")))
+            outs = ex.get("answers", ex.get("outputs", ex.get("answer", "")))
             answers = outs if isinstance(outs, list) else [str(outs)]
+            # question + answer_prefix (e.g. "...is") cues the expected answer format
+            q = " ".join(x for x in (ex.get("question", ""), ex.get("answer_prefix", "")) if x).strip()
             yield {
                 "id": f"ruler32k-{subset}-{k}",
                 "subset": subset,
-                "context": ex["input"],
-                "question": "Answer the query stated in the document above. Reply with the answer only.",
+                "context": ex["context"],
+                "question": q or "Answer the query stated in the document above. Reply with the answer only.",
                 "answers": [str(a) for a in answers],
             }
 

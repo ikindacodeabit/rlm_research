@@ -24,33 +24,42 @@ with open(f"{out}/longbench_v2.jsonl", "w") as f:
 print(f"LongBench v2: {len(ds)} examples")
 
 # --- RULER 32k ---
-# Prebuilt mirror on the Hub, one config per sequence length; we take 32768.
-# Each row carries the synthetic prompt (`input`), the gold answer(s) (`outputs`)
-# and the task SUBSET (`task`). We normalise to a stable schema so the loader
-# (benchmarks/datasets.py:load_ruler32k) doesn't depend on upstream column names.
-print("Downloading RULER 32k ...")
-rds = load_dataset("simonjegou/ruler", "32768")
-split = next(iter(rds.keys()))          # single split; name varies by repo
-rows = rds[split]
+# Source: xAlg-AI/att-hub-ruler-32k (the sparse-attention-hub RULER-32k build).
+# The 13 RULER subsets are separate CONFIGS, each with a split of the same name,
+# and rows carry proper context/question/answer_prefix/answer fields. We iterate
+# every subset and normalise to one stable schema so the loader
+# (benchmarks/datasets.py:load_ruler32k) is decoupled from upstream column names.
+RULER_REPO = "xAlg-AI/att-hub-ruler-32k"
+RULER_SUBSETS = ["cwe", "fwe", "niah_multikey_1", "niah_multikey_2",
+                 "niah_multikey_3", "niah_multiquery", "niah_multivalue",
+                 "niah_single_1", "niah_single_2", "niah_single_3",
+                 "qa_1", "qa_2", "vt"]
 def _col(ex, *names, default=""):
     for nm in names:
         if nm in ex and ex[nm] is not None:
             return ex[nm]
     return default
+print(f"Downloading RULER 32k from {RULER_REPO} ...")
 with open(f"{out}/ruler32k.jsonl", "w") as f:
-    subsets = {}
-    for i, ex in enumerate(rows):
-        sub = _col(ex, "task", "subset", default="unknown")
-        outs = _col(ex, "outputs", "answers", "answer", default="")
-        f.write(json.dumps({
-            "index": _col(ex, "index", default=i),
-            "subset": sub,
-            "input": _col(ex, "input", "context", "prompt"),
-            "outputs": outs if isinstance(outs, list) else [str(outs)],
-        }) + "\n")
-        subsets[sub] = subsets.get(sub, 0) + 1
-print(f"RULER 32k: {len(rows)} examples across {len(subsets)} subsets: "
-      + ", ".join(f"{k}={v}" for k, v in sorted(subsets.items())))
+    counts = {}
+    for sub in RULER_SUBSETS:
+        try:
+            rows = load_dataset(RULER_REPO, sub, split=sub)
+        except Exception:                       # split name may differ; take the first
+            d = load_dataset(RULER_REPO, sub)
+            rows = d[next(iter(d.keys()))]
+        for ex in rows:
+            ans = _col(ex, "answer", "outputs", "answers", default="")
+            f.write(json.dumps({
+                "subset": sub,
+                "context": _col(ex, "context", "input"),
+                "question": _col(ex, "question"),
+                "answer_prefix": _col(ex, "answer_prefix"),
+                "answers": ans if isinstance(ans, list) else [str(ans)],
+            }) + "\n")
+        counts[sub] = len(rows)
+print(f"RULER 32k: {sum(counts.values())} examples across {len(counts)} subsets: "
+      + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
 # --- OOLONG ---
 # The OOLONG benchmark splits live on the Hugging Face Hub; the repo/config
