@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Download the three benchmarks to $RLM_DATA_DIR as normalised JSONL (Mac/NIM).
+
+Unlike slurm/download_data.sh (login-node + Prajna paths), this runs anywhere
+with internet — your Mac. It caches:
+  * ruler32k.jsonl      RULER-32k, 13 subsets   (xAlg-AI/att-hub-ruler-32k)
+  * longbench.jsonl     LongBench v1, 16 EN subsets (THUDM/LongBench)
+  * longbench_v2.jsonl  LongBench v2, 6 domains (THUDM/LongBench-v2)
+
+The loaders in benchmarks/datasets.py read exactly these files. Re-running skips
+files that already exist unless --force is given. Choose a subset of benchmarks
+with --only ruler32k,longbench,longbench_v2.
+
+Usage:
+  python scripts/download_data.py
+  python scripts/download_data.py --only longbench --force
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+DATA_DIR = Path(os.environ.get("RLM_DATA_DIR", os.path.expanduser("~/rlm_data")))
+
+# 16 English LongBench v1 subsets (the canonical English benchmark). Chinese
+# subsets are omitted: they need a Chinese-capable model + jieba-based metrics.
+LONGBENCH_EN = [
+    "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique",
+    "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum",
+    "passage_count", "passage_retrieval_en", "lcc", "repobench-p",
+]
+
+RULER_SUBSETS = [
+    "cwe", "fwe", "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
+    "niah_multiquery", "niah_multivalue", "niah_single_1", "niah_single_2",
+    "niah_single_3", "qa_1", "qa_2", "vt",
+]
+
+
+def _col(ex, *names, default=""):
+    for nm in names:
+        if nm in ex and ex[nm] is not None:
+            return ex[nm]
+    return default
+
+
+def download_ruler32k(out: Path):
+    from datasets import load_dataset
+    repo = "xAlg-AI/att-hub-ruler-32k"
+    print(f"Downloading ruler32k from {repo} ...")
+    counts = {}
+    with open(out, "w") as f:
+        for sub in RULER_SUBSETS:
+            try:
+                rows = load_dataset(repo, sub, split=sub)
+            except Exception:
+                d = load_dataset(repo, sub)
+                rows = d[next(iter(d.keys()))]
+            for ex in rows:
+                ans = _col(ex, "answer", "outputs", "answers", default="")
+                f.write(json.dumps({
+                    "subset": sub,
+                    "context": _col(ex, "context", "input"),
+                    "question": _col(ex, "question"),
+                    "answer_prefix": _col(ex, "answer_prefix"),
+                    "answers": ans if isinstance(ans, list) else [str(ans)],
+                }) + "\n")
+            counts[sub] = len(rows)
+    print(f"  ruler32k: {sum(counts.values())} rows / {len(counts)} subsets")
+
+
+def download_longbench(out: Path):
+    # datasets>=3 dropped script loaders, and THUDM/LongBench ships a loader
+    # script; its data lives in data.zip as data/{subset}.jsonl. Read directly.
+    import zipfile
+    from huggingface_hub import hf_hub_download
+    print("Downloading LongBench v1 (16 English subsets) ...")
+    zip_path = hf_hub_download("THUDM/LongBench", "data.zip", repo_type="dataset")
+    counts = {}
+    with zipfile.ZipFile(zip_path) as z, open(out, "w") as fout:
+        for sub in LONGBENCH_EN:
+            member = f"data/{sub}.jsonl"
+            n = 0
+            with z.open(member) as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    ex = json.loads(raw)
+                    fout.write(json.dumps({
+                        "_id": ex.get("_id"),
+                        "dataset": sub,
+                        "input": ex.get("input", ""),
+                        "context": ex.get("context", ""),
+                        "answers": ex.get("answers", []),
+                        "all_classes": ex.get("all_classes", []),
+                    }) + "\n")
+                    n += 1
+            counts[sub] = n
+            print(f"  {sub}: {n}")
+    print(f"  longbench: {sum(counts.values())} rows / {len(counts)} subsets")
+
+
+def download_longbench_v2(out: Path):
+    # THUDM/LongBench-v2 ships a single data.json array (no parquet/script).
+    from huggingface_hub import hf_hub_download
+    print("Downloading LongBench v2 ...")
+    src = hf_hub_download("THUDM/LongBench-v2", "data.json", repo_type="dataset")
+    with open(src) as f:
+        rows = json.load(f)
+    domains = {}
+    with open(out, "w") as fout:
+        for ex in rows:
+            domains[ex.get("domain", "?")] = domains.get(ex.get("domain", "?"), 0) + 1
+            fout.write(json.dumps(ex) + "\n")
+    print(f"  longbench_v2: {len(rows)} rows across {len(domains)} domains: "
+          + ", ".join(f"{k}={v}" for k, v in sorted(domains.items())))
+
+
+JOBS = {
+    "ruler32k": ("ruler32k.jsonl", download_ruler32k),
+    "longbench": ("longbench.jsonl", download_longbench),
+    "longbench_v2": ("longbench_v2.jsonl", download_longbench_v2),
+}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--only", default=None,
+                    help="comma list of: ruler32k,longbench,longbench_v2 (default all)")
+    ap.add_argument("--force", action="store_true", help="re-download even if cached")
+    args = ap.parse_args()
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    wanted = args.only.split(",") if args.only else list(JOBS)
+    print(f"RLM_DATA_DIR = {DATA_DIR}")
+    for name in wanted:
+        fname, fn = JOBS[name]
+        path = DATA_DIR / fname
+        if path.exists() and not args.force:
+            print(f"skip {name} (exists: {path}; use --force to refresh)")
+            continue
+        fn(path)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

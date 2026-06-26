@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rlm.client import NIMClient
 from rlm.rlm import RLM, MemoryBudget, vanilla_answer
 from benchmarks.datasets import TASKS
+from benchmarks.longbench_metrics import score_example
 
 
 def normalize(s: str) -> str:
@@ -140,7 +141,18 @@ def main() -> None:
                 except Exception as e:
                     record.update(pred=None, error=f"{type(e).__name__}: {e}",
                                   steps=0, finished=False, end_reason="exception")
-                record["score"] = round(recall(record.get("pred"), ex["answers"]), 4)
+                # Task-aware scoring: LongBench (v1/v2) examples carry a `metric`
+                # (qa_f1/rouge/classification/.../choice); everything else (RULER,
+                # synthetic) keeps the substring-recall score.
+                metric = ex.get("metric")
+                if metric:
+                    score_val = score_example(metric, record.get("pred"), ex["answers"],
+                                              dataset=ex.get("subset"),
+                                              all_classes=ex.get("all_classes"))
+                else:
+                    score_val = recall(record.get("pred"), ex["answers"])
+                record["metric"] = metric or "recall"
+                record["score"] = round(score_val, 4)
                 record["correct"] = record["score"] == 1.0
                 record["latency_s"] = round(time.time() - t0, 2)
                 record["tokens"] = root.usage.total_tokens + sub.usage.total_tokens - tok0

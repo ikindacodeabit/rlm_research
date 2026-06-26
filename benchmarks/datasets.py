@@ -12,6 +12,8 @@ import random
 import string
 from pathlib import Path
 
+from benchmarks.longbench_metrics import DATASET2METRIC
+
 DATA_DIR = Path(os.environ.get("RLM_DATA_DIR", os.path.expanduser("~/rlm_data")))
 
 WORDS = (
@@ -65,21 +67,77 @@ def gen_multikey(n_examples: int = 50, ctx_chars: int = 200_000, n_keys: int = 8
 
 
 def load_longbench_v2(limit: int | None = None):
-    """Reads the JSONL cached by slurm/download_data.sh."""
+    """LongBench v2 (THUDM/LongBench-v2): multiple-choice over very long contexts.
+
+    Cached as one JSONL by scripts/download_data.py. Examples are tagged with
+    their `domain` as the `subset` (6 domains: single/multi-doc QA, long ICL,
+    long-dialogue, code-repo, structured data) so score.py reports per-domain
+    rows. `limit` is PER SUBSET (domain), matching the RULER loader. Scoring uses
+    the `choice` metric (exact A/B/C/D match), not substring recall.
+    """
     path = DATA_DIR / "longbench_v2.jsonl"
     if not path.exists():
-        raise FileNotFoundError(f"{path} missing — run slurm/download_data.sh on the login node first.")
+        raise FileNotFoundError(f"{path} missing — run scripts/download_data.py first.")
+    per_subset = limit or 200
+    seen: dict[str, int] = {}
     with open(path) as f:
         for i, line in enumerate(f):
-            if limit and i >= limit:
-                break
+            line = line.strip()
+            if not line:
+                continue
             ex = json.loads(line)
-            choices = "\n".join(f"({k}) {ex[k]}" for k in ("choice_A", "choice_B", "choice_C", "choice_D") if ex.get(k))
+            subset = ex.get("domain") or "unknown"
+            k = seen.get(subset, 0)
+            if k >= per_subset:
+                continue
+            seen[subset] = k + 1
+            choices = "\n".join(f"({c}) {ex[f'choice_{c}']}" for c in ("A", "B", "C", "D") if ex.get(f"choice_{c}"))
             yield {
                 "id": ex.get("_id", f"lb2-{i}"),
+                "subset": subset,
+                "metric": "choice",
                 "context": ex["context"],
                 "question": f"{ex['question']}\n{choices}\nAnswer with the letter (A/B/C/D) only.",
                 "answers": [ex["answer"]],
+            }
+
+
+def load_longbench(limit: int | None = None):
+    """LongBench v1 (THUDM/LongBench): 16 English subsets, each scored with its
+    own task-specific metric (F1 / ROUGE-L / classification / retrieval / count /
+    code edit-similarity — see longbench_metrics.DATASET2METRIC).
+
+    Cached as one JSONL by scripts/download_data.py; rows carry the upstream
+    fields {dataset, input, context, answers, all_classes}. `limit` is PER SUBSET
+    (dataset), matching the RULER loader, so one run sweeps every subset. Each
+    yielded example carries `metric` (so run_benchmark scores it correctly) and
+    `all_classes` (needed by the classification metric for trec).
+    """
+    path = DATA_DIR / "longbench.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} missing — run scripts/download_data.py first.")
+    per_subset = limit or 200
+    seen: dict[str, int] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            ex = json.loads(line)
+            subset = ex.get("dataset") or "unknown"
+            k = seen.get(subset, 0)
+            if k >= per_subset:
+                continue
+            seen[subset] = k + 1
+            answers = ex.get("answers") or []
+            yield {
+                "id": ex.get("_id", f"{subset}-{k}"),
+                "subset": subset,
+                "metric": DATASET2METRIC.get(subset, "qa_f1"),
+                "all_classes": ex.get("all_classes"),
+                "context": ex["context"],
+                "question": ex.get("input", "Answer the question based on the document above."),
+                "answers": [str(a) for a in answers] if isinstance(answers, list) else [str(answers)],
             }
 
 
@@ -146,6 +204,7 @@ TASKS = {
     "niah": lambda limit: gen_niah(n_examples=limit or 50),
     "niah-1m": lambda limit: gen_niah(n_examples=limit or 20, ctx_chars=1_000_000, seed=7),
     "multikey": lambda limit: gen_multikey(n_examples=limit or 50),
+    "longbench": load_longbench,
     "longbench_v2": load_longbench_v2,
     "oolong": load_oolong,
     "ruler16k": lambda limit: _load_ruler("ruler16k", limit),

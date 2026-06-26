@@ -10,3 +10,4 @@ logs/
 hf_cache/
 rlm_data/
 results/
+.env
