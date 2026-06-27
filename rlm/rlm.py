@@ -27,6 +27,8 @@ import ast
 import contextlib
 import io
 import re
+import signal
+import threading
 import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -111,6 +113,14 @@ TEXT_FINAL_RE = re.compile(
 TEXT_FINAL_VAR_RE = re.compile(r"FINAL_VAR\(\s*[\"'](\w+)[\"']\s*\)")
 
 
+class _ExecTimeout(Exception):
+    """Raised by the SIGALRM handler when model-generated code exceeds its budget."""
+
+
+def _raise_exec_timeout(signum, frame):  # pragma: no cover - signal handler
+    raise _ExecTimeout()
+
+
 # --------------------------------------------------------------------------- #
 # Token accounting
 # --------------------------------------------------------------------------- #
@@ -184,6 +194,7 @@ class RLM:
         budget: Optional[MemoryBudget] = None,
         token_counter: Optional[Callable[[str], int]] = None,
         cache_subcalls: bool = True,
+        exec_timeout: float = 30.0,
     ):
         self.root = root_client
         self.sub = sub_client or root_client
@@ -192,6 +203,7 @@ class RLM:
         self.max_subcall_chars = max_subcall_chars
         self.budget = budget
         self.cache_subcalls = cache_subcalls
+        self.exec_timeout = exec_timeout
         self.tok = TokenCounter(token_counter)
 
     # ---------------- REPL plumbing ----------------
@@ -256,6 +268,16 @@ class RLM:
                         "```python block with real newlines."
                     )
         buf = io.StringIO()
+        # Bound model-generated code with a wall-clock timeout so an infinite or
+        # runaway loop can't hang the whole benchmark. SIGALRM interrupts a stuck
+        # pure-Python loop between bytecodes (main thread only); it does NOT
+        # interrupt a C-level regex — a known CPython limitation.
+        use_alarm = (
+            self.exec_timeout
+            and hasattr(signal, "SIGALRM")
+            and threading.current_thread() is threading.main_thread()
+        )
+        old_handler = None
         try:
             with contextlib.redirect_stdout(buf):
                 try:
@@ -274,6 +296,9 @@ class RLM:
                         ):
                             literals.append(str(node.args[0].value))
                 env["_rlm_final_literals"] = literals
+                if use_alarm:
+                    old_handler = signal.signal(signal.SIGALRM, _raise_exec_timeout)
+                    signal.setitimer(signal.ITIMER_REAL, self.exec_timeout)
                 if tree and tree.body and isinstance(tree.body[-1], ast.Expr):
                     last = tree.body[-1]
                     assign = ast.Assign(
@@ -291,8 +316,20 @@ class RLM:
                         print(val if isinstance(val, str) else repr(val))
                 else:
                     exec(code, env)  # noqa: S102
+        except _ExecTimeout:
+            buf.write(
+                f"\n[TIMEOUT] your code ran longer than {self.exec_timeout:.0f}s and was "
+                "aborted — almost certainly an infinite or runaway loop. Rewrite it to "
+                "terminate: avoid unbounded while-loops, bound every iteration, and operate "
+                "on slices of `context` instead of rescanning it repeatedly."
+            )
         except Exception:
             buf.write("\n[EXCEPTION]\n" + traceback.format_exc(limit=3))
+        finally:
+            if use_alarm:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                if old_handler is not None:
+                    signal.signal(signal.SIGALRM, old_handler)
         out = buf.getvalue()
         if len(out) > obs_limit:
             half = obs_limit // 2

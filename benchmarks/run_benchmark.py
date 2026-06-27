@@ -63,6 +63,9 @@ def main() -> None:
     ap.add_argument("--base-url", default="https://integrate.api.nvidia.com/v1")
     ap.add_argument("--rpm", type=int, default=35)
     ap.add_argument("--max-steps", type=int, default=12)
+    ap.add_argument("--exec-timeout", type=float, default=30.0,
+                    help="wall-clock seconds a single RLM code block may run before being "
+                         "aborted (guards against model-generated infinite loops)")
     ap.add_argument("--vanilla-char-limit", type=int, default=400_000)
     # --- RLM memory-budget knobs (no budget unless --max-context-tokens is set) ---
     # Eviction-only: out-of-budget turns are simply dropped (no notes/summarization).
@@ -92,7 +95,8 @@ def main() -> None:
             max_context_tokens=args.max_context_tokens,
             keep_recent_turns=args.keep_recent_turns,
         )
-    rlm = RLM(root_client=root, sub_client=sub, max_steps=args.max_steps, budget=budget)
+    rlm = RLM(root_client=root, sub_client=sub, max_steps=args.max_steps, budget=budget,
+              exec_timeout=args.exec_timeout)
 
     for mode in modes:
         slug = args.root_model.replace("/", "_")
