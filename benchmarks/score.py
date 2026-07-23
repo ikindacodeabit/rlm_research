@@ -24,11 +24,18 @@ def aggregate(results_dir: str):
     for path in sorted(Path(results_dir).rglob("*.jsonl")):
         variant = path.parent.name if path.parent != Path(results_dir) else "root"
         task, mode, model = path.stem.split(".", 2)
+        # Dedupe by example id: a retried (non-error) record replaces an earlier
+        # errored one from e.g. a transient NIM outage; later records win ties.
+        by_id: dict = {}
         for line in open(path):
             line = line.strip()
             if not line:
                 continue
             r = json.loads(line)
+            prev = by_id.get(r["id"])
+            if prev is None or not r.get("error") or prev.get("error"):
+                by_id[r["id"]] = r
+        for r in by_id.values():
             # group per RULER subset when present; one group otherwise (back-compat)
             key = (task, variant, mode, model, r.get("subset") or "")
             row = rows[key]

@@ -11,3 +11,6 @@ hf_cache/
 rlm_data/
 results/
 .env
+
+# local-only results explorer website (never commit it)
+rlm-results-site/

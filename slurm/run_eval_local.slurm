@@ -32,7 +32,11 @@ MODEL=Qwen/Qwen3-8B
 # REQUIRED for the thinking runs and HARMLESS for the no-think runs (no think block
 # to extract). If your vLLM build rejects 'qwen3', try 'deepseek_r1'
 # (vllm serve --help | grep -i reason).
-vllm serve "$MODEL" --served-model-name "$MODEL" --port 8000 --max-model-len 32768 \
+# Serve at Qwen3-8B's native 40960 (same as the ruler/budget/scratchpad scripts):
+# vLLM rejects any request where prompt + max_tokens > max-model-len, so the larger
+# window lets the ~30k-token vanilla long-context prompt fit AND leaves room for the
+# think cells' bigger --max-tokens. RLM is unaffected (it reads context from the REPL).
+vllm serve "$MODEL" --served-model-name "$MODEL" --port 8000 --max-model-len 40960 \
   --reasoning-parser qwen3 \
   --gpu-memory-utilization 0.90 --enforce-eager -O0 > logs/vllm.$SLURM_JOB_ID.log 2>&1 &
 VLLM_PID=$!
@@ -57,11 +61,16 @@ for THINK in nothink think; do
   for TASK in niah multikey longbench_v2; do
     for MODE in vanilla rlm; do
       echo "=== $(date '+%F %T') :: $TASK / $MODE / $THINK ==="
+      # Qwen3 <think> tokens share the generation budget with the visible answer,
+      # so give the RLM root more room on think runs. Only RLM (its per-turn prompt
+      # is small); vanilla keeps the 4096 default because its prompt is large and
+      # prompt + max_tokens must stay under the served window.
+      if [ "$THINK" = think ] && [ "$MODE" = rlm ]; then MAXTOK_FLAG="--max-tokens 8192"; else MAXTOK_FLAG=""; fi
       python benchmarks/run_benchmark.py \
         --task "$TASK" --mode "$MODE" --limit 50 \
         --base-url http://localhost:8000/v1 \
         --root-model "$MODEL" --sub-model "$MODEL" \
-        $THINK_FLAG \
+        $THINK_FLAG $MAXTOK_FLAG \
         --rpm 600 \
         --max-steps 50 \
         --vanilla-char-limit 120000 \

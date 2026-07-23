@@ -3,13 +3,15 @@
 
 Unlike slurm/download_data.sh (login-node + Prajna paths), this runs anywhere
 with internet — your Mac. It caches:
+  * ruler16k.jsonl      RULER-16k, 13 subsets   (xAlg-AI/att-hub-ruler-16k)
   * ruler32k.jsonl      RULER-32k, 13 subsets   (xAlg-AI/att-hub-ruler-32k)
   * longbench.jsonl     LongBench v1, 16 EN subsets (THUDM/LongBench)
   * longbench_v2.jsonl  LongBench v2, 6 domains (THUDM/LongBench-v2)
 
 The loaders in benchmarks/datasets.py read exactly these files. Re-running skips
 files that already exist unless --force is given. Choose a subset of benchmarks
-with --only ruler32k,longbench,longbench_v2.
+with --only ruler16k,ruler32k,longbench,longbench_v2. This is the single,
+cross-platform downloader — slurm/download_data.sh calls it on the login node.
 
 Usage:
   python scripts/download_data.py
@@ -46,16 +48,22 @@ def _col(ex, *names, default=""):
     return default
 
 
-def download_ruler32k(out: Path):
+RULER_REPOS = {
+    "ruler16k": "xAlg-AI/att-hub-ruler-16k",
+    "ruler32k": "xAlg-AI/att-hub-ruler-32k",
+}
+
+
+def _download_ruler(out: Path, stem: str):
     from datasets import load_dataset
-    repo = "xAlg-AI/att-hub-ruler-32k"
-    print(f"Downloading ruler32k from {repo} ...")
+    repo = RULER_REPOS[stem]
+    print(f"Downloading {stem} from {repo} ...")
     counts = {}
     with open(out, "w") as f:
         for sub in RULER_SUBSETS:
             try:
                 rows = load_dataset(repo, sub, split=sub)
-            except Exception:
+            except Exception:                   # split name may differ; take the first
                 d = load_dataset(repo, sub)
                 rows = d[next(iter(d.keys()))]
             for ex in rows:
@@ -68,7 +76,7 @@ def download_ruler32k(out: Path):
                     "answers": ans if isinstance(ans, list) else [str(ans)],
                 }) + "\n")
             counts[sub] = len(rows)
-    print(f"  ruler32k: {sum(counts.values())} rows / {len(counts)} subsets")
+    print(f"  {stem}: {sum(counts.values())} rows / {len(counts)} subsets")
 
 
 def download_longbench(out: Path):
@@ -120,7 +128,8 @@ def download_longbench_v2(out: Path):
 
 
 JOBS = {
-    "ruler32k": ("ruler32k.jsonl", download_ruler32k),
+    "ruler16k": ("ruler16k.jsonl", lambda out: _download_ruler(out, "ruler16k")),
+    "ruler32k": ("ruler32k.jsonl", lambda out: _download_ruler(out, "ruler32k")),
     "longbench": ("longbench.jsonl", download_longbench),
     "longbench_v2": ("longbench_v2.jsonl", download_longbench_v2),
 }
@@ -129,7 +138,7 @@ JOBS = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default=None,
-                    help="comma list of: ruler32k,longbench,longbench_v2 (default all)")
+                    help="comma list of: ruler16k,ruler32k,longbench,longbench_v2 (default all)")
     ap.add_argument("--force", action="store_true", help="re-download even if cached")
     args = ap.parse_args()
 

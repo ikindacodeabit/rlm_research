@@ -59,6 +59,22 @@ examples in `results/mac_nim/*.jsonl` are skipped.
 
 Quick smoke first: `LIMIT=5 bash scripts/run_all_mac.sh`.
 
+### Variant sweeps (RLM only, Qwen on NIM)
+
+```bash
+bash scripts/run_budget_sweep_mac.sh      # eviction-only MemoryBudget sweep
+bash scripts/run_scratchpad_sweep_mac.sh  # scratchpad-only + scratchpad×budget
+```
+
+The scratchpad sweep gives the RLM root a persistent `note()` tool
+(`--scratchpad`): notes are re-shown to the model every turn and survive budget
+eviction. `BUDGETS` may include the literal `none` for the unbounded
+scratchpad-only cell (default sweeps `none 2048 … 32768`); extra knob
+`MAX_NOTES_TOKENS` (default 1024). Results land in
+`results/qwen3_scratchpad_sweep/sp_<none|b####>/`, disjoint from the budget
+sweep's `results/qwen3_budget_sweep/b####/`. Smoke:
+`LIMIT=2 BUDGETS=none TASKS=longbench_v2 bash scripts/run_scratchpad_sweep_mac.sh`.
+
 ## 3. Read the results
 
 `scripts/run_all_mac.sh` ends by printing the table and writing

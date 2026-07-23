@@ -43,10 +43,16 @@ ls "$HF_HOME/hub" | grep -i qwen3   # expect: models--Qwen--Qwen3-8B
 ```
 
 ## Step 3 — Download benchmark data (login node)
-niah + multikey are generated in-process (no download). Only longbench_v2 needs data:
+niah + multikey are generated in-process (no download). The dataset-backed tasks
+(longbench_v2 for the main grid; ruler16k/ruler32k for `run_eval_ruler.slurm`) are
+fetched by one unified, cross-platform downloader:
 ```bash
-bash slurm/download_data.sh        # writes ~/rlm_data/longbench_v2.jsonl
+bash slurm/download_data.sh        # -> ~/rlm_data/{longbench_v2,ruler16k,ruler32k,longbench}.jsonl
+# subset it if you like:  DATASETS=ruler16k,longbench_v2 bash slurm/download_data.sh
 ```
+This wraps `scripts/download_data.py` — LongBench-v2 comes via `hf_hub_download` of
+`data.json` (the method that actually works; plain `load_dataset` has no
+parquet/script to load).
 
 ## Step 4 — Smoke test (40-min GPU job)
 Validates the whole path on ONE example before you spend GPU quota on the full grid.
@@ -68,12 +74,28 @@ If you see `<think>` blocks, thinking-disable isn't working — see Troubleshoot
 sbatch slurm/run_eval_local.slurm
 tail -f logs/rlm-local.<JOBID>.out
 ```
-Runs {niah, multikey, longbench_v2} × {vanilla, rlm}, 50 examples each. Resumable —
-re-submitting skips examples already in the JSONL.
+Runs {niah, multikey, longbench_v2} × {vanilla, rlm} × {thinking on/off}, 50
+examples each, into `results/{think,nothink}/`. The server runs at Qwen3-8B's
+native 40960 window (so long vanilla prompts fit and the think cells have
+generation headroom). Resumable — re-submitting skips examples already in the JSONL.
 
 Outputs:
 - `results/<task>.<mode>.Qwen_Qwen3-8B.jsonl` — per-example records
 - `results/transcripts/<task>.rlm.Qwen_Qwen3-8B/<id>.json` — full RLM transcripts
+
+## Step 5b — Budget / scratchpad variants (optional)
+```bash
+sbatch slurm/run_eval_budget.slurm       # eviction-only MemoryBudget sweep
+sbatch slurm/run_eval_scratchpad.slurm   # scratchpad-only + scratchpad×budget sweep
+tail -f logs/rlm-scratch.<JOBID>.out
+```
+`run_eval_scratchpad.slurm` gives the RLM root a persistent `note()` scratchpad
+(`--scratchpad`) and runs it both unbounded (`BUDGETS=none` cell → `results/<think>_sp_none/`)
+and under the same budgets as the eviction sweep (→ `results/<think>_sp_b<budget>/`).
+Together with `run_eval_budget.slurm`'s `results/<think>_b<budget>/` dirs this
+yields the three-way comparison eviction-only vs scratchpad-only vs
+scratchpad+budget. Knobs: `--export=ALL,THINK_MODES=...,BUDGETS=...,MAX_NOTES_TOKENS=...`
+(BUDGETS may include the literal `none`). Both sweeps are resumable on requeue.
 
 ## Step 6 — Score
 ```bash
@@ -98,6 +120,14 @@ python benchmarks/score.py results
 - **Wrong partition:** run `sinfo` and confirm `a40` / qos names before submitting.
 - **`hf: command not found`:** use `huggingface-cli download Qwen/Qwen3-8B`, or
   `python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-8B')"`.
+- **RLM steps look truncated / empty on `think` runs:** Qwen3's `<think>` reasoning
+  shares the generation budget with the visible answer. The think cells already
+  pass `--max-tokens 8192` (vs the 4096 default); raise it with `--max-tokens N`
+  if needed, but keep `prompt + N ≤ --max-model-len` (40960) or vLLM returns a 400.
+- **A code step aborts with `[TIMEOUT]`:** that's the pure-Python exec watchdog
+  (`--exec-timeout`, default 60s). Time spent inside `llm_query` sub-calls is
+  excluded, so this now fires only on genuinely runaway Python — raise
+  `--exec-timeout` if a legit `context` scan over a huge document needs longer.
 
 ---
 

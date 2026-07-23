@@ -1,4 +1,5 @@
-"""Recursive Language Model (RLM) with a configurable MEMORY BUDGET (eviction-only).
+"""Recursive Language Model (RLM) with a configurable MEMORY BUDGET (eviction-only)
+and an optional persistent SCRATCHPAD.
 
 This is a drop-in successor to the minimal scaffold. The paradigm is unchanged
 (Zhang, Kraska & Khattab, 2025): the long prompt is NOT placed in the model's
@@ -8,9 +9,18 @@ root LM writes code to inspect it / recurse via `llm_query`.
 MemoryBudget caps the ROOT model's context window (in tokens), independent of
 document length. The full transcript is kept server-side, but the root only ever
 SEES a bounded view: system + begin + the most-recent turns that fit the budget.
-Older turns are simply DROPPED (evicted) — there is no scratchpad and no
-summarization. Because REPL variables persist across turns, the model can always
-recompute or re-fetch anything an evicted turn produced.
+Older turns are simply DROPPED (evicted). Because REPL variables persist across
+turns, the model can always recompute or re-fetch anything an evicted turn
+produced.
+
+Scratchpad (opt-in, orthogonal to the budget) gives the root a `note(text)` REPL
+tool. Saved notes are re-injected into the root's view on EVERY turn — with or
+without a budget — so, unlike raw REPL output, they never scroll out. (An earlier
+scratchpad was removed because its notes were only re-injected under a budget,
+making it a no-op in unbounded runs; this version injects unconditionally.)
+Under a budget, notes survive eviction, giving the model a durable place for
+evidence beyond persistent variables. Default is OFF: with `scratchpad=None`
+behavior is exactly the eviction-only scaffold above.
 
 Grounding note: the anti-hallucination guard (FINAL literal must appear in real
 output) checks a SEPARATE server-side `seen_output` accumulator, which is never
@@ -53,8 +63,9 @@ RULES:
       sub-LLM CANNOT see `context` or any of your variables — it sees ONLY the
       prompt string you pass. You MUST embed the actual text snippet inside the
       prompt, e.g. llm_query("Answer X based on this text:\\n" + context[i:j])
-      (keep each call under ~8000 characters). Capture the result:
-      ans = llm_query(...) then print(ans).
+      (each call's prompt is truncated at {sub_char_cap} characters, so pass a
+      focused snippet, not the whole document). Capture the result:
+      ans = llm_query(...) then print(ans).{note_tool}
     * `print(...)`: anything you print is shown back to you in the NEXT message
       (truncated to {obs_limit} chars), so print only what you need to see.
 - Strategy: peek at structure first (e.g. `print(context[:2000])`,
@@ -104,8 +115,26 @@ FOLD_MARKER = (
     "below."
 )
 
+NOTE_TOOL_HELP = (
+    "\n    * `note(text: str)`: save a SHORT finding to a persistent scratchpad. "
+    "The scratchpad is shown back to you on every turn, so notes never scroll "
+    "out of view — save key facts, indices, and partial answers there."
+)
+
+SCRATCHPAD_TEMPLATE = (
+    "[SCRATCHPAD] Your saved notes so far (persistent — always visible):\n"
+    "{notes}\n[END SCRATCHPAD]"
+)
+
+FOLD_SCRATCHPAD_TEMPLATE = (
+    "[MEMORY NOTICE] {n} earlier turn(s) were dropped to stay within your memory "
+    "budget. Raw output from them is gone, but the REPL is persistent (your "
+    "variables still exist) and this scratchpad survived:\n"
+    "{notes}\n[END SCRATCHPAD] Continue from the recent output below."
+)
+
 CODE_RE = re.compile(r"```(?:python|repl|py)?[ \t]*\n?(.*?)```", re.DOTALL)
-STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|FINAL_VAR|FINAL"
+STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|note|FINAL_VAR|FINAL"
 ONELINE_FIX_RE = re.compile(rf"(?<=[\)\w'\"])\s+(?=(?:{STMT_KEYWORDS})\b)")
 TEXT_FINAL_RE = re.compile(
     r"FINAL\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL
@@ -174,6 +203,21 @@ class MemoryBudget:
 
 
 @dataclass
+class Scratchpad:
+    """Opt-in persistent notes for the root model (orthogonal to MemoryBudget).
+
+    Enables a `note(text)` REPL tool; saved notes are re-injected into the
+    root's view every turn (and survive budget eviction when a MemoryBudget is
+    also set).
+
+    max_notes_tokens : cap on the notes block injected into context; oldest
+                       text is truncated away once exceeded.
+    """
+
+    max_notes_tokens: int = 1024
+
+
+@dataclass
 class RLMResult:
     answer: str | None
     steps: int
@@ -192,9 +236,10 @@ class RLM:
         obs_limit: int = 6000,
         max_subcall_chars: int = 32000,
         budget: Optional[MemoryBudget] = None,
+        scratchpad: Optional[Scratchpad] = None,
         token_counter: Optional[Callable[[str], int]] = None,
         cache_subcalls: bool = True,
-        exec_timeout: float = 30.0,
+        exec_timeout: float = 60.0,
     ):
         self.root = root_client
         self.sub = sub_client or root_client
@@ -202,12 +247,16 @@ class RLM:
         self.obs_limit = obs_limit
         self.max_subcall_chars = max_subcall_chars
         self.budget = budget
+        self.scratchpad = scratchpad
         self.cache_subcalls = cache_subcalls
         self.exec_timeout = exec_timeout
         self.tok = TokenCounter(token_counter)
+        # True only while _exec's SIGALRM code-timeout is armed; lets llm_query
+        # pause that watchdog around its (legit, possibly slow) sub-LLM call.
+        self._alarm_active = False
 
     # ---------------- REPL plumbing ----------------
-    def _make_env(self, context: str, metrics: dict, cache: dict) -> dict:
+    def _make_env(self, context: str, metrics: dict, cache: dict, notes: list) -> dict:
         final_box: dict = {"value": None, "done": False}
 
         def llm_query(prompt: str) -> str:
@@ -215,12 +264,23 @@ class RLM:
             if self.cache_subcalls and prompt in cache:
                 metrics["sub_cache_hits"] += 1
                 return cache[prompt]
-            ans = self.sub.chat(
-                [
-                    {"role": "system", "content": SUB_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ]
-            )
+            # Pause the code-exec watchdog (armed in _exec) around this blocking
+            # sub-LLM call: a slow-but-legit network call / rate-limit sleep must
+            # NOT be mistaken for a runaway loop. Only pure-Python time between
+            # sub-calls counts toward exec_timeout.
+            remaining = None
+            if self._alarm_active:
+                remaining, _ = signal.setitimer(signal.ITIMER_REAL, 0)
+            try:
+                ans = self.sub.chat(
+                    [
+                        {"role": "system", "content": SUB_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ]
+                )
+            finally:
+                if self._alarm_active and remaining and remaining > 0:
+                    signal.setitimer(signal.ITIMER_REAL, remaining)
             metrics["sub_calls"] += 1
             metrics["sub_call_tokens"] += self.tok.count(prompt) + self.tok.count(ans)
             if self.cache_subcalls:
@@ -237,6 +297,17 @@ class RLM:
             "FINAL": FINAL,
             "re": re,
         }
+
+        if self.scratchpad is not None:
+
+            def note(text) -> str:
+                text = str(text).strip()
+                if text:
+                    notes.append(text)
+                    metrics["notes_saved"] += 1
+                return f"[saved note #{len(notes)}]"
+
+            env["note"] = note
 
         def FINAL_VAR(name) -> None:
             final_box["value"] = str(env.get(str(name), f"<missing var {name}>"))
@@ -299,6 +370,7 @@ class RLM:
                 if use_alarm:
                     old_handler = signal.signal(signal.SIGALRM, _raise_exec_timeout)
                     signal.setitimer(signal.ITIMER_REAL, self.exec_timeout)
+                    self._alarm_active = True
                 if tree and tree.body and isinstance(tree.body[-1], ast.Expr):
                     last = tree.body[-1]
                     assign = ast.Assign(
@@ -326,6 +398,7 @@ class RLM:
         except Exception:
             buf.write("\n[EXCEPTION]\n" + traceback.format_exc(limit=3))
         finally:
+            self._alarm_active = False
             if use_alarm:
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 if old_handler is not None:
@@ -344,6 +417,15 @@ class RLM:
     def _budget_note(self) -> str:
         if self.budget is None:
             return ""
+        if self.scratchpad is not None:
+            return (
+                f"\n- MEMORY BUDGET: your working context is capped at ~{self.budget.max_context_tokens} "
+                "tokens. Once you exceed it, your OLDEST turns are DROPPED automatically. Raw REPL "
+                "output that scrolls out vanishes, but Python VARIABLES persist across turns and "
+                "your note() SCRATCHPAD is always re-shown. So save anything you will need for "
+                "FINAL with note('...') (or keep it in a variable); never rely on old output "
+                "staying visible."
+            )
         return (
             f"\n- MEMORY BUDGET: your working context is capped at ~{self.budget.max_context_tokens} "
             "tokens. Once you exceed it, your OLDEST turns are DROPPED automatically and are gone "
@@ -352,6 +434,14 @@ class RLM:
             "will need for FINAL in a variable (or be ready to recompute it); never rely on old "
             "output staying visible."
         )
+
+    def _notes_block(self, notes: list) -> str:
+        text = "\n".join(f"- {n}" for n in notes) if notes else "(nothing saved yet)"
+        cap = self.scratchpad.max_notes_tokens if self.scratchpad else 1024
+        # keep the scratchpad itself within its sub-budget (drop OLDEST text first)
+        while self.tok.count(text) > cap and len(text) > 200:
+            text = "- ...[oldest notes truncated]\n" + text[int(len(text) * 0.2) :]
+        return text
 
     # ---------------- main loop ----------------
     def run(self, context: str, task: str) -> RLMResult:
@@ -366,8 +456,12 @@ class RLM:
             "evictions": 0,
             "budget": (self.budget.max_context_tokens if self.budget else None),
         }
+        if self.scratchpad is not None:
+            metrics["scratchpad"] = True
+            metrics["notes_saved"] = 0
         cache: dict = {}
-        env = self._make_env(context, metrics, cache)
+        notes: list = []
+        env = self._make_env(context, metrics, cache, notes)
 
         system_msg = {
             "role": "system",
@@ -377,6 +471,8 @@ class RLM:
                 max_steps=self.max_steps,
                 task=task,
                 budget_note=self._budget_note(),
+                note_tool=(NOTE_TOOL_HELP if self.scratchpad is not None else ""),
+                sub_char_cap=self.max_subcall_chars,
             ),
         }
         begin_msg = {"role": "user", "content": "Begin. Write your first code block."}
@@ -392,6 +488,16 @@ class RLM:
             nonlocal evicted_count
             base = [system_msg, begin_msg]
             if self.budget is None:
+                # Scratchpad notes are re-injected every turn even without a
+                # budget — that visibility is the whole point of the tool.
+                if self.scratchpad is not None and notes:
+                    notes_msg = {
+                        "role": "user",
+                        "content": SCRATCHPAD_TEMPLATE.format(
+                            notes=self._notes_block(notes)
+                        ),
+                    }
+                    return base + [notes_msg] + full_history, 0
                 return base + full_history, 0
 
             n_pairs = len(full_history) // 2
@@ -401,7 +507,26 @@ class RLM:
 
             def assemble(kept_pairs, fold_n):
                 msgs = list(base)
-                if fold_n > 0:
+                if self.scratchpad is not None:
+                    if fold_n > 0:
+                        msgs.append(
+                            {
+                                "role": "user",
+                                "content": FOLD_SCRATCHPAD_TEMPLATE.format(
+                                    n=fold_n, notes=self._notes_block(notes)
+                                ),
+                            }
+                        )
+                    elif notes:
+                        msgs.append(
+                            {
+                                "role": "user",
+                                "content": SCRATCHPAD_TEMPLATE.format(
+                                    notes=self._notes_block(notes)
+                                ),
+                            }
+                        )
+                elif fold_n > 0:
                     msgs.append(
                         {"role": "user", "content": FOLD_MARKER.format(n=fold_n)}
                     )

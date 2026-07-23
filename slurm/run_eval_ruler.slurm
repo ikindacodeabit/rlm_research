@@ -33,7 +33,7 @@ MODEL=Qwen/Qwen3-8B
 # --- start ONE vLLM server for every cell ---
 # RULER-32k inputs run to ~32k tokens, and vanilla stuffs the whole thing into the
 # prompt, so the window must exceed 32k to leave generation headroom: serve at
-# Qwen3-8B's native 40960 (vs 32768 in run_eval_local.slurm).
+# Qwen3-8B's native 40960 (matching the other run scripts).
 vllm serve "$MODEL" --served-model-name "$MODEL" --port 8000 --max-model-len 40960 \
   --reasoning-parser qwen3 \
   --gpu-memory-utilization 0.90 --enforce-eager -O0 > logs/vllm.$SLURM_JOB_ID.log 2>&1 &
@@ -65,11 +65,14 @@ for THINK in nothink think; do
   OUTDIR="results/${RULER_TASK}_$THINK"
   for MODE in vanilla rlm; do
     echo "=== $(date '+%F %T') :: $RULER_TASK / $MODE / $THINK (limit=$LIMIT per subset) ==="
+    # more generation room for the RLM root on think runs (see run_eval_local.slurm);
+    # vanilla stays at 4096 — its ~33k-token prompt + max_tokens must fit the window.
+    if [ "$THINK" = think ] && [ "$MODE" = rlm ]; then MAXTOK_FLAG="--max-tokens 8192"; else MAXTOK_FLAG=""; fi
     python benchmarks/run_benchmark.py \
       --task "$RULER_TASK" --mode "$MODE" --limit "$LIMIT" \
       --base-url http://localhost:8000/v1 \
       --root-model "$MODEL" --sub-model "$MODEL" \
-      $THINK_FLAG \
+      $THINK_FLAG $MAXTOK_FLAG \
       --rpm 600 \
       --max-steps 50 \
       --vanilla-char-limit 100000 \

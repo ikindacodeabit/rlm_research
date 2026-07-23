@@ -10,6 +10,7 @@ import json
 import os
 import random
 import string
+import sys
 from pathlib import Path
 
 from benchmarks.longbench_metrics import DATASET2METRIC
@@ -85,21 +86,25 @@ def load_longbench_v2(limit: int | None = None):
             line = line.strip()
             if not line:
                 continue
-            ex = json.loads(line)
-            subset = ex.get("domain") or "unknown"
-            k = seen.get(subset, 0)
-            if k >= per_subset:
+            try:
+                ex = json.loads(line)
+                subset = ex.get("domain") or "unknown"
+                if seen.get(subset, 0) >= per_subset:
+                    continue
+                choices = "\n".join(f"({c}) {ex[f'choice_{c}']}" for c in ("A", "B", "C", "D") if ex.get(f"choice_{c}"))
+                rec = {
+                    "id": ex.get("_id", f"lb2-{i}"),
+                    "subset": subset,
+                    "metric": "choice",
+                    "context": ex["context"],
+                    "question": f"{ex['question']}\n{choices}\nAnswer with the letter (A/B/C/D) only.",
+                    "answers": [ex["answer"]],
+                }
+            except Exception as e:  # skip one bad row, don't kill the whole task
+                print(f"[datasets] skipping malformed longbench_v2 row {i}: {e}", file=sys.stderr)
                 continue
-            seen[subset] = k + 1
-            choices = "\n".join(f"({c}) {ex[f'choice_{c}']}" for c in ("A", "B", "C", "D") if ex.get(f"choice_{c}"))
-            yield {
-                "id": ex.get("_id", f"lb2-{i}"),
-                "subset": subset,
-                "metric": "choice",
-                "context": ex["context"],
-                "question": f"{ex['question']}\n{choices}\nAnswer with the letter (A/B/C/D) only.",
-                "answers": [ex["answer"]],
-            }
+            seen[subset] = seen.get(subset, 0) + 1
+            yield rec
 
 
 def load_longbench(limit: int | None = None):
@@ -123,22 +128,27 @@ def load_longbench(limit: int | None = None):
             line = line.strip()
             if not line:
                 continue
-            ex = json.loads(line)
-            subset = ex.get("dataset") or "unknown"
-            k = seen.get(subset, 0)
-            if k >= per_subset:
+            try:
+                ex = json.loads(line)
+                subset = ex.get("dataset") or "unknown"
+                k = seen.get(subset, 0)
+                if k >= per_subset:
+                    continue
+                answers = ex.get("answers") or []
+                rec = {
+                    "id": ex.get("_id", f"{subset}-{k}"),
+                    "subset": subset,
+                    "metric": DATASET2METRIC.get(subset, "qa_f1"),
+                    "all_classes": ex.get("all_classes"),
+                    "context": ex["context"],
+                    "question": ex.get("input", "Answer the question based on the document above."),
+                    "answers": [str(a) for a in answers] if isinstance(answers, list) else [str(answers)],
+                }
+            except Exception as e:  # skip one bad row, don't kill the whole task
+                print(f"[datasets] skipping malformed longbench row: {e}", file=sys.stderr)
                 continue
             seen[subset] = k + 1
-            answers = ex.get("answers") or []
-            yield {
-                "id": ex.get("_id", f"{subset}-{k}"),
-                "subset": subset,
-                "metric": DATASET2METRIC.get(subset, "qa_f1"),
-                "all_classes": ex.get("all_classes"),
-                "context": ex["context"],
-                "question": ex.get("input", "Answer the question based on the document above."),
-                "answers": [str(a) for a in answers] if isinstance(answers, list) else [str(answers)],
-            }
+            yield rec
 
 
 def load_oolong(limit: int | None = None):
@@ -149,13 +159,18 @@ def load_oolong(limit: int | None = None):
         for i, line in enumerate(f):
             if limit and i >= limit:
                 break
-            ex = json.loads(line)
-            yield {
-                "id": ex.get("id", f"oolong-{i}"),
-                "context": ex["context"],
-                "question": ex["question"],
-                "answers": ex["answers"] if isinstance(ex.get("answers"), list) else [str(ex.get("answer", ""))],
-            }
+            try:
+                ex = json.loads(line)
+                rec = {
+                    "id": ex.get("id", f"oolong-{i}"),
+                    "context": ex["context"],
+                    "question": ex["question"],
+                    "answers": ex["answers"] if isinstance(ex.get("answers"), list) else [str(ex.get("answer", ""))],
+                }
+            except Exception as e:  # skip one bad row, don't kill the whole task
+                print(f"[datasets] skipping malformed oolong row {i}: {e}", file=sys.stderr)
+                continue
+            yield rec
 
 
 def _load_ruler(name: str, limit: int | None = None):
@@ -181,23 +196,28 @@ def _load_ruler(name: str, limit: int | None = None):
             line = line.strip()
             if not line:
                 continue
-            ex = json.loads(line)
-            subset = ex.get("subset") or ex.get("task") or "unknown"
-            k = seen.get(subset, 0)
-            if k >= per_subset:
+            try:
+                ex = json.loads(line)
+                subset = ex.get("subset") or ex.get("task") or "unknown"
+                k = seen.get(subset, 0)
+                if k >= per_subset:
+                    continue
+                outs = ex.get("answers", ex.get("outputs", ex.get("answer", "")))
+                answers = outs if isinstance(outs, list) else [str(outs)]
+                # question + answer_prefix (e.g. "...is") cues the expected answer format
+                q = " ".join(x for x in (ex.get("question", ""), ex.get("answer_prefix", "")) if x).strip()
+                rec = {
+                    "id": f"{name}-{subset}-{k}",
+                    "subset": subset,
+                    "context": ex["context"],
+                    "question": q or "Answer the query stated in the document above. Reply with the answer only.",
+                    "answers": [str(a) for a in answers],
+                }
+            except Exception as e:  # skip one bad row, don't kill the whole task
+                print(f"[datasets] skipping malformed {name} row: {e}", file=sys.stderr)
                 continue
             seen[subset] = k + 1
-            outs = ex.get("answers", ex.get("outputs", ex.get("answer", "")))
-            answers = outs if isinstance(outs, list) else [str(outs)]
-            # question + answer_prefix (e.g. "...is") cues the expected answer format
-            q = " ".join(x for x in (ex.get("question", ""), ex.get("answer_prefix", "")) if x).strip()
-            yield {
-                "id": f"{name}-{subset}-{k}",
-                "subset": subset,
-                "context": ex["context"],
-                "question": q or "Answer the query stated in the document above. Reply with the answer only.",
-                "answers": [str(a) for a in answers],
-            }
+            yield rec
 
 
 TASKS = {

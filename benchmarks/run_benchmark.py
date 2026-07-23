@@ -14,8 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from rlm.client import NIMClient
-from rlm.rlm import RLM, MemoryBudget, vanilla_answer
+from rlm.client import NIMClient, RateLimiter
+from rlm.rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
 from benchmarks.datasets import TASKS
 from benchmarks.longbench_metrics import score_example
 
@@ -24,19 +24,12 @@ def normalize(s: str) -> str:
     return " ".join(str(s).lower().strip().split())
 
 
-def is_correct(pred: str | None, answers: list[str]) -> bool:
-    if pred is None:
-        return False
-    p = normalize(pred)
-    return any(normalize(a) in p for a in answers)
-
-
 def recall(pred: str | None, answers: list[str]) -> float:
     """Partial-credit score in [0,1]: fraction of gold answers present in pred.
 
-    For single-answer tasks this is just 0.0/1.0 (== is_correct). For RULER's
-    multi-needle subsets (multivalue/multiquery/cwe/fwe) it gives partial credit,
-    matching RULER's recall metric.
+    For single-answer tasks this is just 0.0/1.0 (a plain substring hit). For
+    RULER's multi-needle subsets (multivalue/multiquery/cwe/fwe) it gives partial
+    credit, matching RULER's recall metric.
     """
     if pred is None or not answers:
         return 0.0
@@ -46,9 +39,18 @@ def recall(pred: str | None, answers: list[str]) -> float:
 
 
 def load_done(path: Path) -> set:
+    """IDs already completed. Records that died with a harness/API exception
+    (e.g. a transient NIM outage) don't count — re-running retries them."""
     if not path.exists():
         return set()
-    return {json.loads(l)["id"] for l in open(path) if l.strip()}
+    done = set()
+    for l in open(path):
+        if not l.strip():
+            continue
+        r = json.loads(l)
+        if not r.get("error"):
+            done.add(r["id"])
+    return done
 
 
 def main() -> None:
@@ -63,9 +65,14 @@ def main() -> None:
     ap.add_argument("--base-url", default="https://integrate.api.nvidia.com/v1")
     ap.add_argument("--rpm", type=int, default=35)
     ap.add_argument("--max-steps", type=int, default=12)
-    ap.add_argument("--exec-timeout", type=float, default=30.0,
-                    help="wall-clock seconds a single RLM code block may run before being "
-                         "aborted (guards against model-generated infinite loops)")
+    ap.add_argument("--exec-timeout", type=float, default=60.0,
+                    help="wall-clock seconds of PURE-PYTHON execution a single RLM code block "
+                         "may run before being aborted (guards against model-generated infinite "
+                         "loops); time spent inside llm_query sub-calls is excluded")
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="max generation tokens per model call (root and sub). Unset uses the "
+                         "client default (4096); raise it for Qwen3 'think' runs whose "
+                         "<think> reasoning shares this budget with the visible answer")
     ap.add_argument("--vanilla-char-limit", type=int, default=400_000)
     # --- RLM memory-budget knobs (no budget unless --max-context-tokens is set) ---
     # Eviction-only: out-of-budget turns are simply dropped (no notes/summarization).
@@ -73,6 +80,12 @@ def main() -> None:
                     help="cap the RLM root's context window (tokens); unset = unbounded (legacy)")
     ap.add_argument("--keep-recent-turns", type=int, default=3,
                     help="recent (assistant,observation) pairs to keep verbatim under budget")
+    # --- RLM scratchpad knobs (off unless --scratchpad; orthogonal to the budget) ---
+    ap.add_argument("--scratchpad", action="store_true",
+                    help="give the RLM root a note() tool; notes are re-shown every turn "
+                         "and survive budget eviction")
+    ap.add_argument("--max-notes-tokens", type=int, default=1024,
+                    help="cap on the scratchpad block injected into context")
     ap.add_argument("--out", default="results")
     ap.add_argument("--debug", action="store_true",
                     help="print every RLM step (model reply, code, REPL output) live")
@@ -84,8 +97,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     modes = ["vanilla", "rlm"] if args.mode == "both" else [args.mode]
 
-    root = NIMClient(model=args.root_model, base_url=args.base_url, rpm=args.rpm)
-    sub = NIMClient(model=args.sub_model, base_url=args.base_url, rpm=args.rpm)
+    # One limiter shared by root + sub so the rpm cap is per-account (two separate
+    # limiters would let the process issue up to ~2x rpm and trip 429s).
+    limiter = RateLimiter(args.rpm)
+    client_kw = dict(base_url=args.base_url, rpm=args.rpm, limiter=limiter)
+    if args.max_tokens is not None:
+        client_kw["max_tokens"] = args.max_tokens
+    root = NIMClient(model=args.root_model, **client_kw)
+    sub = NIMClient(model=args.sub_model, **client_kw)
     if args.no_think:
         eb = {"chat_template_kwargs": {"enable_thinking": False}}
         root.extra_body = sub.extra_body = eb
@@ -95,8 +114,11 @@ def main() -> None:
             max_context_tokens=args.max_context_tokens,
             keep_recent_turns=args.keep_recent_turns,
         )
+    scratchpad = None
+    if args.scratchpad:
+        scratchpad = Scratchpad(max_notes_tokens=args.max_notes_tokens)
     rlm = RLM(root_client=root, sub_client=sub, max_steps=args.max_steps, budget=budget,
-              exec_timeout=args.exec_timeout)
+              scratchpad=scratchpad, exec_timeout=args.exec_timeout)
 
     for mode in modes:
         slug = args.root_model.replace("/", "_")
@@ -106,7 +128,7 @@ def main() -> None:
         done = load_done(res_path)
         print(f"== {args.task} / {mode} -> {res_path} ({len(done)} already done)")
 
-        n, correct = 0, 0
+        n, correct, score_sum = 0, 0, 0.0
         with open(res_path, "a") as fout:
             for ex in TASKS[args.task](args.limit):
                 if ex["id"] in done:
@@ -166,12 +188,16 @@ def main() -> None:
                 fout.flush()
                 n += 1
                 correct += record["correct"]
+                score_sum += record["score"]
                 print(f"  [{ex['id']}] correct={record['correct']} "
+                      f"score={record['score']} "
                       f"steps={record['steps']} sub_calls={record['sub_calls']} "
                       f"end={record.get('end_reason','')} tokens={record['tokens']} "
                       f"t={record['latency_s']}s")
         if n:
-            print(f"== {mode}: {correct}/{n} correct ({100*correct/n:.1f}%)")
+            # exact-correct is only meaningful for exact-match tasks (niah/ruler);
+            # mean score is the honest number for F1/ROUGE/choice (LongBench).
+            print(f"== {mode}: {correct}/{n} exact-correct, mean score {100*score_sum/n:.1f}%")
     print(f"Total API calls: root={root.usage.calls}, sub={sub.usage.calls}; "
           f"tokens: {root.usage.total_tokens + sub.usage.total_tokens}")
 

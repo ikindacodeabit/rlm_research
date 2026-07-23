@@ -39,7 +39,7 @@ MODEL=Qwen/Qwen3-8B
 # begin + recent turns). The model still has to GENERATE on top of that prompt,
 # so the server window must exceed the largest budget. Our top budget is 32768,
 # so we serve at Qwen3-8B's native 40960 to leave ~8k tokens of generation
-# headroom (vs 32768 in run_eval_local.slurm, which had no large-prompt cap).
+# headroom (all four run scripts serve at this window).
 vllm serve "$MODEL" --served-model-name "$MODEL" --port 8000 --max-model-len 40960 \
   --reasoning-parser qwen3 \
   --gpu-memory-utilization 0.90 --enforce-eager -O0 > logs/vllm.$SLURM_JOB_ID.log 2>&1 &
@@ -65,7 +65,9 @@ echo "vLLM up."
 BUDGETS="${BUDGETS:-2048 4096 8192 16384 32768}"
 THINK_MODES="${THINK_MODES:-nothink think}"
 for THINK in $THINK_MODES; do
-  if [ "$THINK" = nothink ]; then THINK_FLAG="--no-think"; else THINK_FLAG=""; fi
+  # think runs give the RLM root more generation room (Qwen3 <think> shares the
+  # budget); safe since the budgeted prompt (<=32768) + 8192 fits the 40960 window.
+  if [ "$THINK" = nothink ]; then THINK_FLAG="--no-think"; MAXTOK_FLAG=""; else THINK_FLAG=""; MAXTOK_FLAG="--max-tokens 8192"; fi
   for BUDGET in $BUDGETS; do
     OUTDIR="results/${THINK}_b${BUDGET}"
     for TASK in niah multikey longbench_v2; do
@@ -74,7 +76,7 @@ for THINK in $THINK_MODES; do
         --task "$TASK" --mode rlm --limit 50 \
         --base-url http://localhost:8000/v1 \
         --root-model "$MODEL" --sub-model "$MODEL" \
-        $THINK_FLAG \
+        $THINK_FLAG $MAXTOK_FLAG \
         --rpm 600 \
         --max-steps 50 \
         --max-context-tokens "$BUDGET" \
