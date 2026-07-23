@@ -39,10 +39,13 @@ PORT=8000
 echo "=== $(date '+%F %T') :: node=$(hostname) gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1) ==="
 echo "=== model: $MODEL ==="
 
-# --- start vLLM (same flags that worked for Qwen2.5-7B) ---
+# --- start vLLM (mirror the real run scripts so the smoke tests the real config:
+# native 40960 window so the long vanilla NIAH prompt fits, and --reasoning-parser
+# qwen3 — a no-op under --no-think but present in run_eval_local.slurm et al.) ---
 vllm serve "$MODEL" --port "$PORT" \
   --served-model-name "$MODEL" \
-  --max-model-len 32768 \
+  --max-model-len 40960 \
+  --reasoning-parser qwen3 \
   --gpu-memory-utilization 0.90 \
   --enforce-eager -O0 \
   > "logs/vllm.$SLURM_JOB_ID.log" 2>&1 &
