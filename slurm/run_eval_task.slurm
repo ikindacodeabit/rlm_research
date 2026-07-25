@@ -7,8 +7,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --partition=a40
 #SBATCH --qos=a40
-#SBATCH --output=logs/rlm-%x.%J.out
-#SBATCH --error=logs/rlm-%x.%J.err
+#SBATCH --output=logs/%x.%J.out
+#SBATCH --error=logs/%x.%J.err
 
 # ONE driver for every task, so a cross-dataset comparison is not confounded by
 # per-script flag drift. The previous six scripts disagreed on --vanilla-char-limit
@@ -32,7 +32,7 @@ THINK_CONDITIONS="${THINK_CONDITIONS:-nothink think}"
 
 # Refuse to start if another job is already running THIS task. Two jobs writing the
 # same results/*.jsonl duplicate all remaining work: load_done is read ONCE per cell,
-# so the second job cannot see the first job's in-flight rows. (Both also bind :8000.)
+# so the second job cannot see the first job's in-flight rows.
 GUARD_NAME="${SLURM_JOB_NAME:-rlm-eval}"
 if squeue -u "$USER" -h -n "$GUARD_NAME" -o %i | grep -qv "^${SLURM_JOB_ID}$"; then
   echo "another '$GUARD_NAME' job is already running; exiting to avoid duplicate work"
@@ -48,7 +48,17 @@ export NVIDIA_API_KEY=local-dummy       # client requires it to be set; vLLM ign
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
-PORT="${PORT:-8000}"
+# SLURM can co-schedule two of these jobs on ONE node (each asks for only 1 GPU),
+# and a hardcoded port then makes the second vLLM fail to bind. Derive a per-job
+# port from the job id so co-located jobs never collide, then verify it is actually
+# free before serving.
+PORT="${PORT:-$((10000 + SLURM_JOB_ID % 20000))}"
+for _try in $(seq 1 50); do
+  if ! (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then break; fi
+  exec 3<&- 2>/dev/null || true
+  PORT=$((PORT + 1))
+done
+echo "serving on port $PORT (node $(hostname), job $SLURM_JOB_ID)"
 
 # --- one vLLM server for every cell (Qwen3-8B native 40960 window) ---
 vllm serve "$MODEL" --served-model-name "$MODEL" --port "$PORT" --max-model-len 40960 \
