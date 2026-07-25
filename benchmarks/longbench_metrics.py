@@ -21,6 +21,7 @@ from __future__ import annotations
 import difflib
 import re
 import string
+import unicodedata
 from collections import Counter
 
 
@@ -28,7 +29,13 @@ from collections import Counter
 # Normalisation (SQuAD-style) for token-F1
 # --------------------------------------------------------------------------- #
 def normalize_answer(s: str) -> str:
-    """Lower, strip punctuation, drop articles, collapse whitespace."""
+    """Lower, strip punctuation, drop articles, collapse whitespace.
+
+    NFD-normalise first, matching google-deepmind/loft `evaluation/utils.py` and
+    THUDM/LongBench. Without it, accented gold spans decompose differently from
+    the model's output and compare unequal despite being the same text.
+    """
+    s = unicodedata.normalize("NFD", s)
 
     def remove_articles(text):
         return re.sub(r"\b(a|an|the)\b", " ", text)
@@ -144,31 +151,77 @@ def choice_score(prediction: str, ground_truth: str, **_) -> float:
 # --------------------------------------------------------------------------- #
 # LOFT (Long-Context Frontiers) RAG metrics
 # --------------------------------------------------------------------------- #
-# LOFT prompts ask for `Final Answer: ['a', 'b', ...]`, so the gold answers are a
-# LIST even for single-value tasks. Upstream (sparse-attention-hub
-# benchmark/loft/calculate_metrics.py) reports EM / subspan-EM / F1 for the
-# single-value sets (nq, hotpotqa, musique) and EM / subspan-EM / coverage for
-# the multi-value ones (qampari, quest). We take the headline metric of each:
-# subspan-EM single-value, coverage multi-value. Both are containment-based on
-# the normalised text, which is robust to the model wrapping its answer in prose
-# instead of emitting a clean list — strict set-EM would score near zero for a
-# REPL agent that narrates, and would make the RLM-vs-vanilla delta meaningless.
-def subspan_em_score(prediction: str, ground_truth: str, **_) -> float:
-    """1.0 if the normalised gold answer occurs anywhere in the prediction."""
-    gold = normalize_answer(str(ground_truth))
-    if not gold:
-        return 0.0
-    return 1.0 if gold in normalize_answer(prediction) else 0.0
+# Faithful port of google-deepmind/loft `evaluation/utils.py` + `evaluation/rag.py`.
+# The LOFT paper (ACL Findings 2025) uses SUBSPAN EM as the primary metric for all
+# RAG tasks; EM / F1 / coverage are secondaries and are reported alongside so the
+# headline can be changed later without re-running anything.
+#
+# Both arms' predictions arrive here already parsed by benchmarks.answer_extraction
+# into a list of answer strings, exactly as upstream's process_prediction does.
+# All comparisons happen on normalize_answer'd text.
+#
+# Single-value (nq, hotpotqa, musique) and multi-value (qampari, quest) use
+# DIFFERENT rules upstream, and the difference is not cosmetic:
+#   single: max over golds of `gold in pred`            -- unidirectional
+#   multi : bidirectional containment, then a maximum matching, scored
+#           ALL-OR-NOTHING (`float(all(aligned_scores))`)
+def _kuhn_matching(adj: list[set[int]], n_right: int) -> int:
+    """Maximum-cardinality bipartite matching (Kuhn's augmenting paths).
+
+    Upstream calls scipy.optimize.linear_sum_assignment(-scores) on a 0/1 matrix
+    and then asks whether every gold row got a 1. On a 0/1 matrix that is exactly
+    a maximum-cardinality matching, so this is an equivalent result — not an
+    approximation — and it keeps scipy out of the dependency list (it is neither
+    declared in requirements.txt nor installed in the venv).
+    """
+    match_r = [-1] * n_right
+
+    def augment(u: int, seen: set[int]) -> bool:
+        for v in adj[u]:
+            if v in seen:
+                continue
+            seen.add(v)
+            if match_r[v] == -1 or augment(match_r[v], seen):
+                match_r[v] = u
+                return True
+        return False
+
+    return sum(1 for u in range(len(adj)) if augment(u, set()))
 
 
-def loft_coverage_score(prediction: str, answers: list[str], **_) -> float:
-    """Fraction of the gold answers that appear in the prediction (multi-value)."""
-    golds = [normalize_answer(str(a)) for a in answers]
-    golds = [g for g in golds if g]
-    if not golds:
-        return 0.0
-    pred = normalize_answer(prediction)
-    return sum(g in pred for g in golds) / len(golds)
+def loft_scores(
+    gold_answers: list[str], pred_answers: list[str], *, multi_value: bool
+) -> dict[str, float]:
+    """Every LOFT RAG metric at once. `subspan_em` is the primary."""
+    golds = [g for g in (normalize_answer(str(a)) for a in gold_answers) if g]
+    preds = [p for p in (normalize_answer(str(a)) for a in pred_answers) if p]
+    if not golds or not preds:
+        # Upstream scores an empty prediction as 0 across the board. An empty gold
+        # list would make `all([])` vacuously True upstream; we return 0 instead of
+        # crediting a question that has no answer to find.
+        return {"subspan_em": 0.0, "em": 0.0, "f1": 0.0, "coverage": 0.0}
+
+    if multi_value:
+        # rag.compute_multi_value_subspan_em: bidirectional containment + matching,
+        # then float(all(...)) -- every gold must be matched to a DISTINCT pred.
+        adj = [
+            {j for j, p in enumerate(preds) if g in p or p in g}
+            for g in golds
+        ]
+        subspan = 1.0 if _kuhn_matching(adj, len(preds)) == len(golds) else 0.0
+        em = float(set(golds) == set(preds))                 # compute_em_multi_value
+        coverage = len(set(preds) & set(golds)) / len(golds)  # compute_coverage
+        f1 = max(_f1(p.split(), g.split()) for g in golds for p in preds)
+    else:
+        # utils.compute_subspan_em / compute_em / compute_f1, each max over golds,
+        # against the single extracted prediction.
+        pred = preds[0]
+        subspan = max(1.0 if g in pred else 0.0 for g in golds)
+        em = max(float(g == pred) for g in golds)
+        coverage = float(sum(g in pred for g in golds)) / len(golds)
+        f1 = max(_f1(pred.split(), g.split()) for g in golds)
+
+    return {"subspan_em": subspan, "em": em, "f1": f1, "coverage": coverage}
 
 
 # --------------------------------------------------------------------------- #
@@ -204,32 +257,66 @@ _METRIC_FN = {
     "count": count_score,
     "code_sim": code_sim_score,
     "choice": choice_score,
-    "loft_subspan_em": subspan_em_score,
 }
 
-# Set-valued metrics score the WHOLE gold list at once, so they must bypass the
-# max-over-single-golds rule below (taking the max would report 1.0 whenever any
-# one gold was recalled, which is not what coverage means).
-_SET_METRIC_FN = {
-    "loft_coverage": loft_coverage_score,
+# LOFT metrics are computed as a family by loft_scores(); this maps the stored
+# metric name to the key of the primary number. `recall` is handled by the caller
+# (benchmarks/run_benchmark.py) because it predates this module.
+_LOFT_PRIMARY = {"loft_subspan_em": "subspan_em"}
+
+# Metrics whose score==1.0 genuinely means "exactly right", so a boolean `correct`
+# is meaningful. For F1/ROUGE/code_sim a 1.0 is a continuous score that happened to
+# saturate, and reporting it as "exact-correct" is misleading.
+EXACT_MATCH_METRICS = {
+    "choice", "count", "retrieval", "classification", "recall", "loft_subspan_em",
 }
+
+KNOWN_METRICS = set(_METRIC_FN) | set(_LOFT_PRIMARY) | {"recall"}
 
 
 def score_example(metric: str, prediction: str | None, answers: list[str],
-                  *, dataset: str | None = None, all_classes=None) -> float:
-    """Apply a LongBench metric, taking the max over gold answers (upstream rule)."""
+                  *, dataset: str | None = None, all_classes=None,
+                  pred_answers: list[str] | None = None,
+                  multi_value: bool = False) -> float:
+    """Primary score for one example under `metric` (upstream max-over-golds rule).
+
+    `pred_answers` is the output of benchmarks.answer_extraction.extract_answers and
+    is REQUIRED for the LOFT metrics, whose upstream definition operates on a parsed
+    answer list rather than raw text. Other metrics keep taking the raw `prediction`,
+    matching their upstream definitions.
+    """
+    return score_example_all(
+        metric, prediction, answers, dataset=dataset, all_classes=all_classes,
+        pred_answers=pred_answers, multi_value=multi_value,
+    )[0]
+
+
+def score_example_all(metric: str, prediction: str | None, answers: list[str],
+                      *, dataset: str | None = None, all_classes=None,
+                      pred_answers: list[str] | None = None,
+                      multi_value: bool = False) -> tuple[float, dict[str, float]]:
+    """(primary_score, secondary_scores) for one example.
+
+    Secondaries are stored on the record so the headline metric can be changed
+    later without re-running the benchmark.
+    """
+    if metric in _LOFT_PRIMARY:
+        if prediction is None:
+            return 0.0, {"subspan_em": 0.0, "em": 0.0, "f1": 0.0, "coverage": 0.0}
+        preds = pred_answers if pred_answers is not None else [prediction]
+        scores = loft_scores([str(a) for a in answers], preds,
+                             multi_value=multi_value)
+        return scores[_LOFT_PRIMARY[metric]], scores
+
     if prediction is None:
-        return 0.0
+        return 0.0, {}
     pred = prediction
     if dataset in _TRUNCATE_FIRST_LINE:
         pred = pred.lstrip("\n").split("\n")[0]
-    set_fn = _SET_METRIC_FN.get(metric)
-    if set_fn is not None:
-        return set_fn(pred, [str(a) for a in answers])
     fn = _METRIC_FN.get(metric)
     if fn is None:
-        raise ValueError(f"unknown LongBench metric {metric!r}")
+        raise ValueError(f"unknown metric {metric!r}; known: {sorted(KNOWN_METRICS)}")
     best = 0.0
     for gold in answers:
         best = max(best, fn(pred, str(gold), all_classes=all_classes))
-    return best
+    return best, {}

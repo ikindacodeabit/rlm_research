@@ -43,6 +43,7 @@ def gen_niah(n_examples: int = 50, ctx_chars: int = 200_000, seed: int = 0):
         context = body[:pos] + needle + body[pos:]
         yield {
             "id": f"niah-{ctx_chars}-{i}",
+            "metric": "recall",
             "context": context,
             "question": "What is the secret passkey mentioned in the document? Reply with the number only.",
             "answers": [key],
@@ -60,6 +61,7 @@ def gen_multikey(n_examples: int = 50, ctx_chars: int = 200_000, n_keys: int = 8
             body = body[:pos] + f" Asset {j} has value {v} credits. " + body[pos:]
         yield {
             "id": f"multikey-{ctx_chars}-{i}",
+            "metric": "recall",
             "context": body,
             "question": f"There are {n_keys} assets (Asset 0..{n_keys-1}), each with a value in credits. "
                         "What is the SUM of all asset values? Reply with the number only.",
@@ -107,6 +109,23 @@ def load_longbench_v2(limit: int | None = None):
             yield rec
 
 
+
+def _longbench_metric(subset: str) -> str:
+    """LongBench v1 subset -> official metric, refusing to guess.
+
+    The old `.get(subset, "qa_f1")` silently scored anything unrecognised — a
+    Chinese subset, or the "unknown" produced when a row has no `dataset` field —
+    with English-tokenised F1, which looks like a real number and is not one.
+    """
+    try:
+        return DATASET2METRIC[subset]
+    except KeyError:
+        raise KeyError(
+            f"no official LongBench metric for subset {subset!r}; add it to "
+            "DATASET2METRIC in benchmarks/longbench_metrics.py"
+        ) from None
+
+
 def load_longbench(limit: int | None = None):
     """LongBench v1 (THUDM/LongBench): 16 English subsets, each scored with its
     own task-specific metric (F1 / ROUGE-L / classification / retrieval / count /
@@ -138,7 +157,7 @@ def load_longbench(limit: int | None = None):
                 rec = {
                     "id": ex.get("_id", f"{subset}-{k}"),
                     "subset": subset,
-                    "metric": DATASET2METRIC.get(subset, "qa_f1"),
+                    "metric": _longbench_metric(subset),
                     "all_classes": ex.get("all_classes"),
                     "context": ex["context"],
                     "question": ex.get("input", "Answer the question based on the document above."),
@@ -163,6 +182,7 @@ def load_oolong(limit: int | None = None):
                 ex = json.loads(line)
                 rec = {
                     "id": ex.get("id", f"oolong-{i}"),
+                    "metric": "recall",
                     "context": ex["context"],
                     "question": ex["question"],
                     "answers": ex["answers"] if isinstance(ex.get("answers"), list) else [str(ex.get("answer", ""))],
@@ -188,10 +208,14 @@ def _load_loft(name: str, limit: int | None = None):
     RULER and LongBench. `limit` is PER SUBSET (upstream ships 100 test rows each).
 
     The cached `context` already carries LOFT's own instruction preamble (output
-    format + the document corpus), so it is self-contained for the REPL. The
-    `answer_prefix` ("Final Answer: ") is appended to the QUESTION rather than
-    dropped, because run_benchmark never reads answer_prefix and without it the
-    model has no cue to emit the list format the metrics expect.
+    format + the document corpus), so it is self-contained for the REPL.
+
+    `answer_prefix` ("Final Answer: ") is carried on the record, NOT glued onto the
+    question. Gluing it on was arm-asymmetric: vanilla, generating prose straight
+    after the cue, would emit the list format, while for the RLM the cue sat inert
+    at the bottom of a system prompt whose contract is `FINAL(variable)`. Both arms
+    now receive the same explicit output contract via `answer_format` (see
+    run_benchmark), and both are parsed by the same answer_extraction layer.
     """
     path = DATA_DIR / f"{name}.jsonl"
     if not path.exists():
@@ -210,17 +234,23 @@ def _load_loft(name: str, limit: int | None = None):
                 if k >= per_subset:
                     continue
                 base = subset.rsplit("_", 1)[0]          # "nq_32k" -> "nq"
-                question = ex.get("question", "")
-                prefix = (ex.get("answer_prefix") or "").strip()
-                if prefix:
-                    question = f"{question}\n\n{prefix}"
+                prefix = (ex.get("answer_prefix") or "Final Answer:").strip()
                 answers = ex.get("answers") or []
                 rec = {
                     "id": f"{subset}-{k}",
                     "subset": subset,
-                    "metric": "loft_coverage" if base in LOFT_MULTIVALUE else "loft_subspan_em",
+                    # LOFT's primary metric for every RAG task is subspan-EM; the
+                    # single/multi-value split changes the RULE, not the metric.
+                    "metric": "loft_subspan_em",
+                    "multi_value": base in LOFT_MULTIVALUE,
+                    "answer_prefix": prefix,
+                    "answer_format": (
+                        f"{prefix} ['answer1', 'answer2', ...]  (a Python list of "
+                        "answer strings; use a single-element list if there is only "
+                        "one answer)"
+                    ),
                     "context": ex["context"],
-                    "question": question,
+                    "question": ex.get("question", ""),
                     "answers": [str(a) for a in answers] if isinstance(answers, list) else [str(answers)],
                 }
             except Exception as e:  # skip one bad row, don't kill the whole task
@@ -265,6 +295,7 @@ def _load_ruler(name: str, limit: int | None = None):
                 q = " ".join(x for x in (ex.get("question", ""), ex.get("answer_prefix", "")) if x).strip()
                 rec = {
                     "id": f"{name}-{subset}-{k}",
+                    "metric": "recall",
                     "subset": subset,
                     "context": ex["context"],
                     "question": q or "Answer the query stated in the document above. Reply with the answer only.",

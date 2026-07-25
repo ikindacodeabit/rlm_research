@@ -100,7 +100,7 @@ Example of a correct session (3 turns):
 
 The user's task is:
 {task}
-"""
+{answer_format_note}"""
 
 SUB_SYSTEM_PROMPT = (
     "You are a helpful sub-model. Answer the question using ONLY the text "
@@ -444,7 +444,8 @@ class RLM:
         return text
 
     # ---------------- main loop ----------------
-    def run(self, context: str, task: str) -> RLMResult:
+    def run(self, context: str, task: str,
+            answer_format: str | None = None) -> RLMResult:
         metrics = {
             "steps": 0,
             "root_prompt_tokens": 0,
@@ -470,6 +471,12 @@ class RLM:
                 obs_limit=self.obs_limit,
                 max_steps=self.max_steps,
                 task=task,
+                # Same output contract vanilla_answer receives, phrased for the
+                # FINAL() protocol so both arms are asked for the same answer shape.
+                answer_format_note=(
+                    f"\nThe value you pass to FINAL(...) must be formatted as: "
+                    f"{answer_format}\n" if answer_format else ""
+                ),
                 budget_note=self._budget_note(),
                 note_tool=(NOTE_TOOL_HELP if self.scratchpad is not None else ""),
                 sub_char_cap=self.max_subcall_chars,
@@ -777,10 +784,21 @@ class RLM:
 
 
 def vanilla_answer(
-    client: NIMClient, context: str, task: str, char_limit: int = 400_000
+    client: NIMClient, context: str, task: str, char_limit: int = 400_000,
+    answer_format: str | None = None,
 ) -> str:
-    """Baseline: stuff (possibly truncated) context directly into the prompt."""
+    """Baseline: stuff (possibly truncated) context directly into the prompt.
+
+    `answer_format` is the benchmark's output contract (e.g. LOFT's
+    "Final Answer: ['answer1', ...]"). It is passed to BOTH arms — the RLM gets the
+    same string in ROOT_SYSTEM_PROMPT — so neither arm is scored on an answer shape
+    the other was never asked for. Without it this prompt said only "Answer
+    concisely", while the RLM answered via `str(FINAL(x))`; string-matching metrics
+    then measured that style difference as if it were accuracy.
+    """
     truncated = context[:char_limit]
     note = "" if len(context) <= char_limit else "\n[NOTE: document truncated]"
-    prompt = f"Document:\n{truncated}{note}\n\nTask: {task}\nAnswer concisely."
+    fmt = f"\nFormat your answer as: {answer_format}" if answer_format else ""
+    prompt = (f"Document:\n{truncated}{note}\n\nTask: {task}\n"
+              f"Answer concisely.{fmt}")
     return client.chat([{"role": "user", "content": prompt}])

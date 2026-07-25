@@ -16,12 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rlm.client import NIMClient, RateLimiter
 from rlm.rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
+from benchmarks.answer_extraction import extract_answers, strip_reasoning
 from benchmarks.datasets import TASKS
-from benchmarks.longbench_metrics import score_example
-
-
-def normalize(s: str) -> str:
-    return " ".join(str(s).lower().strip().split())
+from benchmarks.longbench_metrics import (
+    EXACT_MATCH_METRICS,
+    normalize_answer,
+    score_example_all,
+)
 
 
 def recall(pred: str | None, answers: list[str]) -> float:
@@ -30,12 +31,56 @@ def recall(pred: str | None, answers: list[str]) -> float:
     For single-answer tasks this is just 0.0/1.0 (a plain substring hit). For
     RULER's multi-needle subsets (multivalue/multiquery/cwe/fwe) it gives partial
     credit, matching RULER's recall metric.
+
+    In-house metric: RULER and the synthetic niah/multikey tasks have no upstream
+    per-example scorer to mirror, unlike LongBench and LOFT. It now shares
+    longbench_metrics.normalize_answer with every other metric — it used to carry
+    its own weaker normaliser (lower+collapse only, no punctuation/article
+    stripping), which made "correct" mean three different things across the repo.
     """
     if pred is None or not answers:
         return 0.0
-    p = normalize(pred)
-    hits = sum(1 for a in answers if normalize(a) in p)
+    p = normalize_answer(str(pred))
+    hits = sum(1 for a in answers if normalize_answer(str(a)) in p)
     return hits / len(answers)
+
+
+def score_record(ex: dict, pred: str | None) -> tuple[str, float, dict]:
+    """Score one prediction. IDENTICAL for the vanilla and RLM arms.
+
+    This is the single scoring site in the harness. Both arms' raw output is put
+    through the same reasoning-strip + answer-extraction before any metric runs,
+    so a metric can never reward one arm's answer STYLE over the other's — see
+    benchmarks/answer_extraction for why that mattered.
+
+    Returns (metric_name, primary_score, secondary_scores).
+    """
+    metric = ex.get("metric")
+    if not metric:
+        raise KeyError(
+            f"example {ex.get('id')!r} has no `metric`; every loader in "
+            "benchmarks/datasets.py must set one explicitly"
+        )
+    if pred is None:
+        return metric, 0.0, {}
+
+    clean = strip_reasoning(pred)
+    if metric == "recall":
+        return metric, recall(clean, ex["answers"]), {}
+
+    pred_answers = extract_answers(
+        clean,
+        answer_prefix=ex.get("answer_prefix"),
+        expect_list=bool(ex.get("multi_value")),
+    )
+    primary, secondary = score_example_all(
+        metric, clean, ex["answers"],
+        dataset=ex.get("subset"),
+        all_classes=ex.get("all_classes"),
+        pred_answers=pred_answers,
+        multi_value=bool(ex.get("multi_value")),
+    )
+    return metric, primary, secondary
 
 
 def load_done(path: Path) -> set:
@@ -139,13 +184,25 @@ def main() -> None:
                 record = {"id": ex["id"], "mode": mode, "answers": ex["answers"]}
                 if ex.get("subset") is not None:
                     record["subset"] = ex["subset"]
+                # Persist everything the scorer consumed, so scripts/rescore.py can
+                # reproduce the score from the record alone. `all_classes` (trec) and
+                # `multi_value` (LOFT) were previously loader-only, which made a
+                # re-score of those subsets silently wrong.
+                for k in ("all_classes", "multi_value", "answer_prefix"):
+                    if ex.get(k) is not None:
+                        record[k] = ex[k]
                 try:
+                    # Same output contract to both arms (None for tasks that carry
+                    # their format instruction inside the question text already).
+                    answer_format = ex.get("answer_format")
                     if mode == "vanilla":
                         pred = vanilla_answer(root, ex["context"], ex["question"],
-                                              char_limit=args.vanilla_char_limit)
+                                              char_limit=args.vanilla_char_limit,
+                                              answer_format=answer_format)
                         record.update(pred=pred, steps=1, finished=True, end_reason="")
                     else:
-                        r = rlm.run(ex["context"], ex["question"])
+                        r = rlm.run(ex["context"], ex["question"],
+                                    answer_format=answer_format)
                         record.update(pred=r.answer, steps=r.steps,
                                       finished=r.finished, end_reason=r.end_reason,
                                       metrics=r.metrics)
@@ -167,19 +224,19 @@ def main() -> None:
                 except Exception as e:
                     record.update(pred=None, error=f"{type(e).__name__}: {e}",
                                   steps=0, finished=False, end_reason="exception")
-                # Task-aware scoring: LongBench (v1/v2) examples carry a `metric`
-                # (qa_f1/rouge/classification/.../choice); everything else (RULER,
-                # synthetic) keeps the substring-recall score.
-                metric = ex.get("metric")
-                if metric:
-                    score_val = score_example(metric, record.get("pred"), ex["answers"],
-                                              dataset=ex.get("subset"),
-                                              all_classes=ex.get("all_classes"))
-                else:
-                    score_val = recall(record.get("pred"), ex["answers"])
-                record["metric"] = metric or "recall"
+                # One scoring site for BOTH arms — see score_record(). Every loader
+                # sets `metric` explicitly; there is no silent fallback any more.
+                metric, score_val, secondary = score_record(ex, record.get("pred"))
+                record["metric"] = metric
                 record["score"] = round(score_val, 4)
-                record["correct"] = record["score"] == 1.0
+                if secondary:
+                    record["secondary_scores"] = {k: round(v, 4)
+                                                  for k, v in secondary.items()}
+                # `correct` only means something for exact-match-family metrics; an
+                # F1/ROUGE of 1.0 is a continuous score that saturated, not an exact
+                # hit, and reporting it as "exact-correct" overstates the result.
+                record["correct"] = (record["score"] == 1.0
+                                     if metric in EXACT_MATCH_METRICS else None)
                 record["latency_s"] = round(time.time() - t0, 2)
                 record["tokens"] = root.usage.total_tokens + sub.usage.total_tokens - tok0
                 record["sub_calls"] = sub.usage.calls - sub0
@@ -187,7 +244,7 @@ def main() -> None:
                 fout.write(json.dumps(record) + "\n")
                 fout.flush()
                 n += 1
-                correct += record["correct"]
+                correct += bool(record["correct"])
                 score_sum += record["score"]
                 print(f"  [{ex['id']}] correct={record['correct']} "
                       f"score={record['score']} "
