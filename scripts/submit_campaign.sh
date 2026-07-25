@@ -57,18 +57,37 @@ if [ -n "$missing" ]; then
 fi
 
 echo "Campaign: results/ <- $TASKS"
+unsubmitted=""
 for t in $TASKS; do
   lim="$(limit_for "$t")"
   cmd=(sbatch --job-name="rlm-$t" --export="ALL,TASK=$t,LIMIT=$lim" slurm/run_eval_task.slurm)
   if [ -n "$DRY" ]; then
     echo "  ${cmd[*]}"
-  else
-    echo "  submitting $t (limit=$lim)"
-    "${cmd[@]}"
+    continue
+  fi
+  # Already queued or running under this name? The in-job guard would catch it, but
+  # skipping here avoids burning one of the QOS submit slots on a job that exits.
+  if squeue -u "$USER" -h -n "rlm-$t" -o %i | grep -q .; then
+    echo "  skipping $t (already queued/running)"
+    continue
+  fi
+  echo "  submitting $t (limit=$lim)"
+  # Do NOT let a rejected submission abort the rest: clusters cap the number of
+  # SUBMITTED jobs per user (QOSMaxSubmitJobPerUserLimit) separately from the number
+  # running, so a long task list legitimately runs out of slots partway through.
+  if ! "${cmd[@]}"; then
+    echo "    ^ submission rejected; will need resubmitting later"
+    unsubmitted="$unsubmitted $t"
   fi
 done
 
 [ -n "$DRY" ] && exit 0
 echo
+if [ -n "$unsubmitted" ]; then
+  echo "NOT SUBMITTED (queue limit):$unsubmitted"
+  echo "Re-run this script once a slot frees; already-running tasks are skipped."
+  echo
+fi
 echo "Watch:   squeue -u \$USER -o '%.10i %.20j %.10M %.6D %R'"
+echo "Ports:   head -n 1 logs/rlm-*.*.out      # confirm co-located jobs differ"
 echo "Score:   python benchmarks/score.py results"
