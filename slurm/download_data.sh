@@ -19,9 +19,11 @@ source ~/venvs/rlm/bin/activate
 # What the SLURM eval scripts consume: longbench_v2 (run_eval_local / _budget /
 # _scratchpad) and ruler16k/ruler32k (run_eval_ruler). niah/multikey are generated
 # in-process (no download). longbench (v1) is fetched too — harmless, and it lets
-# the same cache serve the Mac all-subset harness. Override with DATASETS, e.g.
+# the same cache serve the Mac all-subset harness. loft32k/loft128k feed
+# run_eval_loft (~90 MB and ~350 MB of JSONL respectively; loft1m is ~2.8 GB and
+# is opt-in only). Override with DATASETS, e.g.
 #   DATASETS=ruler16k,longbench_v2 bash slurm/download_data.sh
-DATASETS="${DATASETS:-ruler16k,ruler32k,longbench,longbench_v2}"
+DATASETS="${DATASETS:-ruler16k,ruler32k,longbench,longbench_v2,loft32k,loft128k}"
 python scripts/download_data.py --only "$DATASETS"
 
 # --- OOLONG (still TODO) ---

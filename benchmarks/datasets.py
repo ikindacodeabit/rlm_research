@@ -173,6 +173,63 @@ def load_oolong(limit: int | None = None):
             yield rec
 
 
+# LOFT RAG: 5 datasets x 3 context lengths. nq/hotpotqa/musique are single-value
+# (one gold answer), qampari/quest are multi-value (a set of gold answers), which
+# is what picks the metric — see longbench_metrics.
+LOFT_MULTIVALUE = {"qampari", "quest"}
+
+
+def _load_loft(name: str, limit: int | None = None):
+    """LOFT (Long-Context Frontiers) RAG, read from a JSONL cached by
+    scripts/download_data.py. `name` is the task stem ("loft32k"/"loft128k"/"loft1m").
+
+    Five subsets per length (nq, hotpotqa, musique, qampari, quest), each tagged
+    with `subset` so score.py breaks the table down per subset, exactly like
+    RULER and LongBench. `limit` is PER SUBSET (upstream ships 100 test rows each).
+
+    The cached `context` already carries LOFT's own instruction preamble (output
+    format + the document corpus), so it is self-contained for the REPL. The
+    `answer_prefix` ("Final Answer: ") is appended to the QUESTION rather than
+    dropped, because run_benchmark never reads answer_prefix and without it the
+    model has no cue to emit the list format the metrics expect.
+    """
+    path = DATA_DIR / f"{name}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} missing — run scripts/download_data.py first.")
+    per_subset = limit or 100
+    seen: dict[str, int] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ex = json.loads(line)
+                subset = ex.get("subset") or "unknown"
+                k = seen.get(subset, 0)
+                if k >= per_subset:
+                    continue
+                base = subset.rsplit("_", 1)[0]          # "nq_32k" -> "nq"
+                question = ex.get("question", "")
+                prefix = (ex.get("answer_prefix") or "").strip()
+                if prefix:
+                    question = f"{question}\n\n{prefix}"
+                answers = ex.get("answers") or []
+                rec = {
+                    "id": f"{subset}-{k}",
+                    "subset": subset,
+                    "metric": "loft_coverage" if base in LOFT_MULTIVALUE else "loft_subspan_em",
+                    "context": ex["context"],
+                    "question": question,
+                    "answers": [str(a) for a in answers] if isinstance(answers, list) else [str(answers)],
+                }
+            except Exception as e:  # skip one bad row, don't kill the whole task
+                print(f"[datasets] skipping malformed {name} row: {e}", file=sys.stderr)
+                continue
+            seen[subset] = k + 1
+            yield rec
+
+
 def _load_ruler(name: str, limit: int | None = None):
     """RULER (xAlg-AI/att-hub-ruler-{16,32}k), read from a JSONL cached by
     slurm/download_data.sh. `name` is the task stem ("ruler16k" / "ruler32k").
@@ -229,4 +286,7 @@ TASKS = {
     "oolong": load_oolong,
     "ruler16k": lambda limit: _load_ruler("ruler16k", limit),
     "ruler32k": lambda limit: _load_ruler("ruler32k", limit),
+    "loft32k": lambda limit: _load_loft("loft32k", limit),
+    "loft128k": lambda limit: _load_loft("loft128k", limit),
+    "loft1m": lambda limit: _load_loft("loft1m", limit),
 }

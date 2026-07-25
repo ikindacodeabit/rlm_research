@@ -142,6 +142,36 @@ def choice_score(prediction: str, ground_truth: str, **_) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# LOFT (Long-Context Frontiers) RAG metrics
+# --------------------------------------------------------------------------- #
+# LOFT prompts ask for `Final Answer: ['a', 'b', ...]`, so the gold answers are a
+# LIST even for single-value tasks. Upstream (sparse-attention-hub
+# benchmark/loft/calculate_metrics.py) reports EM / subspan-EM / F1 for the
+# single-value sets (nq, hotpotqa, musique) and EM / subspan-EM / coverage for
+# the multi-value ones (qampari, quest). We take the headline metric of each:
+# subspan-EM single-value, coverage multi-value. Both are containment-based on
+# the normalised text, which is robust to the model wrapping its answer in prose
+# instead of emitting a clean list — strict set-EM would score near zero for a
+# REPL agent that narrates, and would make the RLM-vs-vanilla delta meaningless.
+def subspan_em_score(prediction: str, ground_truth: str, **_) -> float:
+    """1.0 if the normalised gold answer occurs anywhere in the prediction."""
+    gold = normalize_answer(str(ground_truth))
+    if not gold:
+        return 0.0
+    return 1.0 if gold in normalize_answer(prediction) else 0.0
+
+
+def loft_coverage_score(prediction: str, answers: list[str], **_) -> float:
+    """Fraction of the gold answers that appear in the prediction (multi-value)."""
+    golds = [normalize_answer(str(a)) for a in answers]
+    golds = [g for g in golds if g]
+    if not golds:
+        return 0.0
+    pred = normalize_answer(prediction)
+    return sum(g in pred for g in golds) / len(golds)
+
+
+# --------------------------------------------------------------------------- #
 # dataset (subset) -> metric, and the few-shot prediction truncation rule
 # --------------------------------------------------------------------------- #
 DATASET2METRIC = {
@@ -174,6 +204,14 @@ _METRIC_FN = {
     "count": count_score,
     "code_sim": code_sim_score,
     "choice": choice_score,
+    "loft_subspan_em": subspan_em_score,
+}
+
+# Set-valued metrics score the WHOLE gold list at once, so they must bypass the
+# max-over-single-golds rule below (taking the max would report 1.0 whenever any
+# one gold was recalled, which is not what coverage means).
+_SET_METRIC_FN = {
+    "loft_coverage": loft_coverage_score,
 }
 
 
@@ -185,6 +223,9 @@ def score_example(metric: str, prediction: str | None, answers: list[str],
     pred = prediction
     if dataset in _TRUNCATE_FIRST_LINE:
         pred = pred.lstrip("\n").split("\n")[0]
+    set_fn = _SET_METRIC_FN.get(metric)
+    if set_fn is not None:
+        return set_fn(pred, [str(a) for a in answers])
     fn = _METRIC_FN.get(metric)
     if fn is None:
         raise ValueError(f"unknown LongBench metric {metric!r}")

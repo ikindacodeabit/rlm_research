@@ -7,6 +7,8 @@ with internet — your Mac. It caches:
   * ruler32k.jsonl      RULER-32k, 13 subsets   (xAlg-AI/att-hub-ruler-32k)
   * longbench.jsonl     LongBench v1, 16 EN subsets (THUDM/LongBench)
   * longbench_v2.jsonl  LongBench v2, 6 domains (THUDM/LongBench-v2)
+  * loft32k.jsonl       LOFT RAG @32k, 5 subsets (f20180301/loft-rag-*-32k)
+  * loft128k.jsonl      LOFT RAG @128k, 5 subsets (f20180301/loft-rag-*-128k)
 
 The loaders in benchmarks/datasets.py read exactly these files. Re-running skips
 files that already exist unless --force is given. Choose a subset of benchmarks
@@ -79,6 +81,40 @@ def _download_ruler(out: Path, stem: str):
     print(f"  {stem}: {sum(counts.values())} rows / {len(counts)} subsets")
 
 
+# LOFT RAG (Long-Context Frontiers). sparse-attention-hub's benchmark/loft
+# resolves each task to "f20180301/loft-rag-{dataset}-{length}"; we mirror that
+# so the two harnesses read identical data. 100 test rows per subset.
+LOFT_DATASETS = ["nq", "hotpotqa", "musique", "qampari", "quest"]
+
+LOFT_LENGTHS = {"loft32k": "32k", "loft128k": "128k", "loft1m": "1m"}
+
+
+def _download_loft(out: Path, stem: str):
+    from datasets import load_dataset
+    length = LOFT_LENGTHS[stem]
+    print(f"Downloading {stem} (LOFT RAG @ {length}) ...")
+    counts = {}
+    with open(out, "w") as f:
+        for ds in LOFT_DATASETS:
+            repo = f"f20180301/loft-rag-{ds}-{length}"
+            try:
+                rows = load_dataset(repo, split="test")
+            except Exception as e:
+                print(f"  WARN: {repo} unavailable ({e}); skipping")
+                continue
+            for ex in rows:
+                ans = _col(ex, "answers", "answer", default=[])
+                f.write(json.dumps({
+                    "subset": _col(ex, "task", default=f"{ds}_{length}"),
+                    "context": _col(ex, "context"),
+                    "question": _col(ex, "question"),
+                    "answer_prefix": _col(ex, "answer_prefix"),
+                    "answers": ans if isinstance(ans, list) else [str(ans)],
+                }) + "\n")
+            counts[ds] = len(rows)
+    print(f"  {stem}: {sum(counts.values())} rows / {len(counts)} subsets")
+
+
 def download_longbench(out: Path):
     # datasets>=3 dropped script loaders, and THUDM/LongBench ships a loader
     # script; its data lives in data.zip as data/{subset}.jsonl. Read directly.
@@ -132,18 +168,26 @@ JOBS = {
     "ruler32k": ("ruler32k.jsonl", lambda out: _download_ruler(out, "ruler32k")),
     "longbench": ("longbench.jsonl", download_longbench),
     "longbench_v2": ("longbench_v2.jsonl", download_longbench_v2),
+    "loft32k": ("loft32k.jsonl", lambda out: _download_loft(out, "loft32k")),
+    "loft128k": ("loft128k.jsonl", lambda out: _download_loft(out, "loft128k")),
+    # ~5.6 MB of context per row x 500 rows: ~2.8 GB, and far past any window we
+    # serve. Not in the default set — request it explicitly with --only loft1m.
+    "loft1m": ("loft1m.jsonl", lambda out: _download_loft(out, "loft1m")),
 }
+
+_DEFAULT_JOBS = [j for j in JOBS if j != "loft1m"]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default=None,
-                    help="comma list of: ruler16k,ruler32k,longbench,longbench_v2 (default all)")
+                    help="comma list of: ruler16k,ruler32k,longbench,longbench_v2,"
+                         "loft32k,loft128k,loft1m (default: all but loft1m)")
     ap.add_argument("--force", action="store_true", help="re-download even if cached")
     args = ap.parse_args()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    wanted = args.only.split(",") if args.only else list(JOBS)
+    wanted = args.only.split(",") if args.only else list(_DEFAULT_JOBS)
     print(f"RLM_DATA_DIR = {DATA_DIR}")
     for name in wanted:
         fname, fn = JOBS[name]
