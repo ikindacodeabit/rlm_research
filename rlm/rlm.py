@@ -39,6 +39,7 @@ import io
 import re
 import signal
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -134,6 +135,10 @@ FOLD_SCRATCHPAD_TEMPLATE = (
 )
 
 CODE_RE = re.compile(r"```(?:python|repl|py)?[ \t]*\n?(.*?)```", re.DOTALL)
+# Fallback for a reply whose code block was cut off at max_tokens: an OPENING fence
+# with no closing one. Without this the reply reads as "no code block", burns a nudge,
+# and after three such replies the raw truncated text is returned as the answer.
+UNTERMINATED_CODE_RE = re.compile(r"```(?:python|repl|py)?[ \t]*\n(.*)\Z", re.DOTALL)
 STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|note|FINAL_VAR|FINAL"
 ONELINE_FIX_RE = re.compile(rf"(?<=[\)\w'\"])\s+(?=(?:{STMT_KEYWORDS})\b)")
 TEXT_FINAL_RE = re.compile(
@@ -144,6 +149,19 @@ TEXT_FINAL_VAR_RE = re.compile(r"FINAL_VAR\(\s*[\"'](\w+)[\"']\s*\)")
 
 class _ExecTimeout(Exception):
     """Raised by the SIGALRM handler when model-generated code exceeds its budget."""
+
+
+def _mentions(haystack: str, needle: str) -> bool:
+    """Word-boundary containment, for the `answer appears in the task text` check.
+
+    Plain `needle in haystack` whitelisted almost every short answer: any question
+    containing "12" anywhere licensed the ungrounded answer 12, and every
+    classification/multiple-choice task enumerates its labels in the prompt, so that
+    whole class of tasks had no grounding at all.
+    """
+    if not needle:
+        return False
+    return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", haystack) is not None
 
 
 def _raise_exec_timeout(signum, frame):  # pragma: no cover - signal handler
@@ -240,6 +258,8 @@ class RLM:
         token_counter: Optional[Callable[[str], int]] = None,
         cache_subcalls: bool = True,
         exec_timeout: float = 60.0,
+        run_timeout: float | None = 900.0,
+        max_sub_calls: int | None = 40,
     ):
         self.root = root_client
         self.sub = sub_client or root_client
@@ -250,6 +270,15 @@ class RLM:
         self.scratchpad = scratchpad
         self.cache_subcalls = cache_subcalls
         self.exec_timeout = exec_timeout
+        # Wall-clock ceiling for ONE example. exec_timeout deliberately excludes
+        # llm_query time (a slow sub-call is legitimate), and NIMClient retries up to
+        # 6x with a 300s timeout plus backoff -- roughly 30 minutes per sub-call, with
+        # no cap on sub-calls per step. Without a deadline a single pathological
+        # example can stall a 48h job for hours. None disables.
+        self.run_timeout = run_timeout
+        self.max_sub_calls = max_sub_calls
+        self._sub_call_budget: int | None = None
+        self._deadline: float | None = None
         self.tok = TokenCounter(token_counter)
         # True only while _exec's SIGALRM code-timeout is armed; lets llm_query
         # pause that watchdog around its (legit, possibly slow) sub-LLM call.
@@ -260,10 +289,21 @@ class RLM:
         final_box: dict = {"value": None, "done": False}
 
         def llm_query(prompt: str) -> str:
-            prompt = str(prompt)[: self.max_subcall_chars]
-            if self.cache_subcalls and prompt in cache:
+            # Key on the FULL prompt. Keying on the truncated one made two different
+            # calls that share a 32k-char prefix collide -- e.g. context[0:100000] and
+            # context[0:200000] -- silently returning one slice's answer for the other.
+            key = str(prompt)
+            if self.cache_subcalls and key in cache:
                 metrics["sub_cache_hits"] += 1
-                return cache[prompt]
+                return cache[key]
+            if self._sub_call_budget is not None and metrics["sub_calls"] >= self._sub_call_budget:
+                return ("[SUB-CALL LIMIT REACHED] No further llm_query calls are "
+                        "available for this example. Answer from what you have already "
+                        "seen, or use plain string/regex operations on `context`.")
+            prompt = key[: self.max_subcall_chars]
+            if len(key) > self.max_subcall_chars:
+                prompt += (f"\n[NOTE: your prompt was truncated at "
+                           f"{self.max_subcall_chars} chars; pass a smaller snippet]")
             # Pause the code-exec watchdog (armed in _exec) around this blocking
             # sub-LLM call: a slow-but-legit network call / rate-limit sleep must
             # NOT be mistaken for a runaway loop. Only pure-Python time between
@@ -279,12 +319,16 @@ class RLM:
                     ]
                 )
             finally:
-                if self._alarm_active and remaining and remaining > 0:
-                    signal.setitimer(signal.ITIMER_REAL, remaining)
+                # `remaining is not None`, not `remaining` -- setitimer returns 0.0
+                # for an already-expired timer, and the truthiness test then skipped
+                # re-arming, silently disabling the exec watchdog for the REST of the
+                # cell while _alarm_active still read True.
+                if self._alarm_active and remaining is not None:
+                    signal.setitimer(signal.ITIMER_REAL, max(remaining, 0.05))
             metrics["sub_calls"] += 1
             metrics["sub_call_tokens"] += self.tok.count(prompt) + self.tok.count(ans)
             if self.cache_subcalls:
-                cache[prompt] = ans
+                cache[key] = ans
             return ans
 
         def FINAL(answer) -> None:
@@ -310,7 +354,16 @@ class RLM:
             env["note"] = note
 
         def FINAL_VAR(name) -> None:
-            final_box["value"] = str(env.get(str(name), f"<missing var {name}>"))
+            # Raise rather than answering "<missing var X>", which used to be recorded
+            # as a FINISHED, successful prediction. The NameError lands in the REPL
+            # observation, so the model sees and can correct it.
+            key = str(name)
+            if key not in env:
+                raise NameError(
+                    f"FINAL_VAR({key!r}): no variable named {key!r} exists in the "
+                    "REPL. Assign it first, or call FINAL(<expression>) directly."
+                )
+            final_box["value"] = str(env[key])
             final_box["done"] = True
 
         env["FINAL_VAR"] = FINAL_VAR
@@ -395,7 +448,13 @@ class RLM:
                 "terminate: avoid unbounded while-loops, bound every iteration, and operate "
                 "on slices of `context` instead of rescanning it repeatedly."
             )
-        except Exception:
+        except KeyboardInterrupt:
+            raise                       # operator Ctrl-C must still stop the run
+        except BaseException:
+            # BaseException, not Exception: model code calling exit()/quit()/sys.exit()
+            # raises SystemExit, which would otherwise escape _exec, escape run(), and
+            # escape run_benchmark's `except Exception` -- terminating the whole sweep
+            # mid-campaign. Treat it as an ordinary cell failure.
             buf.write("\n[EXCEPTION]\n" + traceback.format_exc(limit=3))
         finally:
             self._alarm_active = False
@@ -462,6 +521,9 @@ class RLM:
             metrics["notes_saved"] = 0
         cache: dict = {}
         notes: list = []
+        self._sub_call_budget = self.max_sub_calls
+        self._deadline = (time.monotonic() + self.run_timeout
+                          if self.run_timeout else None)
         env = self._make_env(context, metrics, cache, notes)
 
         system_msg = {
@@ -560,6 +622,12 @@ class RLM:
             return sent, fold_n
 
         for step in range(1, self.max_steps + 1):
+            if self._deadline is not None and time.monotonic() > self._deadline:
+                # Out of wall-clock. Return the best grounded material we have rather
+                # than None, so a timeout is distinguishable from a genuine abstention.
+                return RLMResult(
+                    None, step, False, transcript, "run_timeout", metrics
+                )
             metrics["steps"] = step
             sent, _ = build_sent()
             ctx_tokens = self.tok.count_messages(sent)
@@ -571,6 +639,13 @@ class RLM:
             reply = self.root.chat(sent)
             metrics["root_completion_tokens"] += self.tok.count(reply)
             blocks = CODE_RE.findall(reply)
+            if not blocks:
+                m_trunc = UNTERMINATED_CODE_RE.search(reply)
+                if m_trunc and m_trunc.group(1).strip():
+                    blocks = [m_trunc.group(1)]
+                    metrics["truncated_code_blocks"] = (
+                        metrics.get("truncated_code_blocks", 0) + 1
+                    )
 
             # adaptive observation limit: never let one observation exceed the budget
             obs_limit = self.obs_limit
@@ -584,7 +659,7 @@ class RLM:
                 m = TEXT_FINAL_RE.search(reply)
                 if m:
                     val = m.group(1).strip()
-                    if val and (val in seen_output or val in task):
+                    if val and (val in seen_output or _mentions(task, val)):
                         transcript.append(
                             {
                                 "step": step,
@@ -622,8 +697,8 @@ class RLM:
                     )
                     continue
                 mv = TEXT_FINAL_VAR_RE.search(reply)
-                if mv:
-                    val = str(env.get(mv.group(1), f"<missing var {mv.group(1)}>"))
+                if mv and mv.group(1) in env:
+                    val = str(env[mv.group(1)])
                     transcript.append(
                         {
                             "step": step,
@@ -684,7 +759,7 @@ class RLM:
                 if (
                     val in (env.get("_rlm_final_literals") or [])
                     and val not in seen_output
-                    and val not in task
+                    and not _mentions(task, val)
                 ):
                     env["_final_box"]["done"] = False
                     env["_final_box"]["value"] = None

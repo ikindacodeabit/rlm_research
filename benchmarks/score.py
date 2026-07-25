@@ -21,7 +21,7 @@ def aggregate(results_dir: str):
     rows = defaultdict(lambda: {"n": 0, "score": 0.0, "tokens": 0, "latency": 0.0,
                                 "unfinished": 0, "errors": 0,
                                 "peak_sum": 0, "peak_n": 0, "budget": None,
-                                "metrics": set()})
+                                "abstain": 0})
     for path in sorted(Path(results_dir).rglob("*.jsonl")):
         variant = path.parent.name if path.parent != Path(results_dir) else "root"
         task, mode, model = path.stem.split(".", 2)
@@ -44,7 +44,6 @@ def aggregate(results_dir: str):
                    r.get("metric") or "?")
             row = rows[key]
             row["n"] += 1
-            row["metrics"].add(r.get("metric") or "?")
             if r.get("score") is None:
                 # Pre-standard records stored only a boolean `correct`. Deriving a
                 # score from it silently reports 0.0 for a partially-correct answer,
@@ -57,6 +56,11 @@ def aggregate(results_dir: str):
             row["tokens"] += r.get("tokens", 0)
             row["latency"] += r.get("latency_s", 0)
             row["unfinished"] += not r.get("finished", True)
+            # Abstention: the RLM can return pred=None (max_steps / ungrounded_final /
+            # run_timeout) and score a structural 0. Vanilla always emits something and
+            # can pick up accidental partial credit, so a score column alone is not a
+            # like-for-like comparison -- ~12% of RLM records abstain. Report it.
+            row["abstain"] += r.get("pred") is None
             row["errors"] += "error" in r
             # budget / peak-context come from the RLM metrics dict (absent for vanilla)
             metrics = r.get("metrics") or {}
@@ -79,9 +83,9 @@ def main() -> None:
 
     # "score%" not "acc%": for qa_f1/rouge/code_sim this column is a mean metric
     # value, not an accuracy, and calling it accuracy propagated into every plot.
-    hdr = (f"{'task':<14}{'subset':<16}{'variant':<16}{'mode':<9}{'model':<34}"
-           f"{'metric':<16}{'budget':>8}{'n':>5}{'score%':>8}{'tok/q':>9}{'s/q':>7}"
-           f"{'peakctx':>9}{'unfin':>7}{'err':>5}")
+    hdr = (f"{'task':<14}{'subset':<22}{'variant':<16}{'mode':<9}{'model':<34}"
+           f"{'metric':<16}{'budget':>8}{'n':>5}{'score%':>8}{'abst%':>7}"
+           f"{'tok/q':>9}{'s/q':>7}{'peakctx':>9}{'unfin':>7}{'err':>5}")
     print(hdr)
     print("-" * len(hdr))
     csv_rows = []
@@ -90,15 +94,17 @@ def main() -> None:
         budget = r["budget"] if r["budget"] is not None else ""
         peak = round(r["peak_sum"] / r["peak_n"]) if r["peak_n"] else ""
         acc = 100 * r["score"] / n
+        abstain = 100 * r["abstain"] / n
         tok_q = r["tokens"] // n
         s_q = r["latency"] / n
-        print(f"{task:<14}{subset:<16}{variant:<16}{mode:<9}{model:<34}"
-              f"{metric:<16}{str(budget):>8}{r['n']:>5}{acc:>8.1f}{tok_q:>9}{s_q:>7.1f}"
-              f"{str(peak):>9}{r['unfinished']:>7}{r['errors']:>5}")
+        print(f"{task:<14}{subset:<22}{variant:<16}{mode:<9}{model:<34}"
+              f"{metric:<16}{str(budget):>8}{r['n']:>5}{acc:>8.1f}{abstain:>7.1f}"
+              f"{tok_q:>9}{s_q:>7.1f}{str(peak):>9}{r['unfinished']:>7}{r['errors']:>5}")
         csv_rows.append({
             "task": task, "subset": subset, "variant": variant, "mode": mode,
             "model": model, "metric": metric, "budget": budget, "n": r["n"],
             "score": round(acc, 1), "acc": round(acc, 1),
+            "abstain_pct": round(abstain, 1),
             "tok_per_q": tok_q, "s_per_q": round(s_q, 1), "peak_ctx": peak,
             "finished": r["n"] - r["unfinished"], "unfin": r["unfinished"],
             "err": r["errors"],
@@ -108,7 +114,7 @@ def main() -> None:
         # `acc` is kept as an alias of `score` so results/plot_budget.py and any
         # existing CSV consumer keep working after the rename.
         fields = ["task", "subset", "variant", "mode", "model", "metric", "budget",
-                  "n", "score", "acc",
+                  "n", "score", "acc", "abstain_pct",
                   "tok_per_q", "s_per_q", "peak_ctx", "finished", "unfin", "err"]
         with open(args.csv, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)

@@ -1,21 +1,19 @@
-"""One shared answer-extraction layer, applied identically to BOTH arms.
+"""LOFT's answer-parsing step, applied identically to both arms.
 
-Why this exists: the vanilla arm emits free prose from a single completion, while
-the RLM arm emits `str(FINAL(x))` — plus four other channels (`final_in_prose`,
-`final_var_in_prose`, `repetition_broken` which answers from the SUB model, and
-`gave_up_no_code` which returns the raw reply). Feeding those raw strings straight
-into a string-matching metric measures answer STYLE as much as correctness, in
-opposite directions depending on the metric: `count_score`/`retrieval_score` divide
-by the number of digit-runs in the prediction and so punish prose, while ROUGE-L's
-precision denominator punishes length, and `str(FINAL(["a","b"]))` injects brackets
-and quotes that punish the RLM under token-F1.
+SCOPE — read this before reusing it elsewhere. This is NOT a universal
+"normalise every prediction" layer, and deliberately so:
 
-The fix is to normalise the SHAPE of the prediction once, before any metric runs, so
-the metric sees a comparable answer regardless of which arm produced it.
+  * LOFT's official evaluation (google-deepmind/loft) parses the model's output
+    into an answer list BEFORE scoring, so parsing IS part of that benchmark's
+    metric definition. This module implements that step.
+  * LongBench v1/v2 and RULER define their metrics over the RAW generation.
+    Running predictions through an extractor there would diverge from the
+    published numbers, so `score_record` does not do it.
 
-`extract_answers` mirrors LOFT's parsing (google-deepmind/loft, and
-sparse-attention-hub `benchmark/loft/calculate_metrics.py`): prefer a bracketed
-Python list, else the text following the answer prefix, else the whole string.
+Arm parity for those benchmarks is handled on the GENERATION side instead: every
+loader supplies an `answer_format` that both `vanilla_answer` and the RLM's
+ROOT_SYSTEM_PROMPT receive, so the two arms are asked for the same answer shape
+and the official raw-text metric is then fair to both. See benchmarks/datasets.py.
 """
 from __future__ import annotations
 
@@ -25,52 +23,103 @@ import re
 # Qwen3 and friends emit a visible reasoning block. In this repo it is normally
 # stripped SERVER-side (every slurm script serves with --reasoning-parser qwen3,
 # and client.chat returns message.content, not reasoning_content), so this is a
-# defensive guard for the Mac/NIM path and for any run that omits the flag. It is
-# a no-op on predictions that never contained a think block.
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_DANGLING_THINK_RE = re.compile(r"^.*?</think>", re.DOTALL | re.IGNORECASE)
+# defensive guard for the Mac/NIM path and for any run that omits the flag.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think>.*\Z", re.DOTALL | re.IGNORECASE)
+_THINK_LEADING_CLOSE_RE = re.compile(r"\A.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
 def strip_reasoning(text: str | None) -> str:
-    """Remove <think>...</think> blocks from a raw completion."""
+    """Remove <think>...</think> reasoning from a raw completion.
+
+    Handles three shapes, all of which occur in practice:
+      * a well-formed block;
+      * a stray leading `</think>` (server consumed the opening tag);
+      * an UNCLOSED `<think>` (generation hit max_tokens mid-thought) — everything
+        from the tag onward is reasoning, so it is dropped rather than scored.
+    """
     if not text:
         return ""
-    out = _THINK_RE.sub(" ", text)
-    # An unclosed block means generation was cut off mid-thought; a stray closing
-    # tag means the opening tag was consumed by the server parser. Both leave
-    # reasoning text that would otherwise be scored as the answer.
-    if "</think>" in out:
-        out = _DANGLING_THINK_RE.sub(" ", out)
+    out = _THINK_BLOCK_RE.sub(" ", text)
+    while "</think>" in out:
+        out = _THINK_LEADING_CLOSE_RE.sub(" ", out, count=1)
+    out = _THINK_OPEN_RE.sub(" ", out)
     return out.strip()
 
 
-def _parse_list(text: str) -> list[str] | None:
-    """Return the LAST bracketed Python list in `text`, or None.
+def _iter_balanced_lists(text: str):
+    """Yield substrings of `text` that look like balanced [...] spans.
 
-    Last, not first: models often restate the requested format ("in the format
-    ['answer1', 'answer2']") before giving the real answer.
+    Quote-aware: brackets inside string literals are ignored, so
+    `["a [ b", "c"]` parses instead of confusing the depth counter. Candidates are
+    yielded OUTERMOST-first (left to right by start), so a nested list is returned
+    whole rather than having its last inner list win.
     """
-    starts = [m.start() for m in re.finditer(r"\[", text)]
-    for start in reversed(starts):
-        depth, end = 0, None
-        for i in range(start, len(text)):
-            if text[i] == "[":
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "[":
+            i += 1
+            continue
+        depth, quote, esc, j = 0, "", False, i
+        while j < n:
+            ch = text[j]
+            if quote:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote:
+                    quote = ""
+            elif ch in "\"'":
+                quote = ch
+            elif ch == "[":
                 depth += 1
-            elif text[i] == "]":
+            elif ch == "]":
                 depth -= 1
                 if depth == 0:
-                    end = i + 1
+                    yield text[i : j + 1]
                     break
-        if end is None:
-            continue
+            j += 1
+        i += 1
+
+
+def _parse_list(text: str) -> list[str] | None:
+    """Return the first parseable balanced Python list in `text`, else None."""
+    for candidate in _iter_balanced_lists(text):
         try:
-            val = ast.literal_eval(text[start:end])
+            val = ast.literal_eval(candidate)
         except (ValueError, SyntaxError):
             continue
         if isinstance(val, (list, tuple)):
-            items = [str(v).strip() for v in val if str(v).strip()]
+            # Flatten one level: a model that emits [["a","b"],["c","d"]] means four
+            # answers, not two stringified sublists. LOFT gold answers are always
+            # flat strings, so a nested list is malformed output to be recovered.
+            items: list[str] = []
+            for v in val:
+                for x in (v if isinstance(v, (list, tuple)) else [v]):
+                    s = str(x).strip()
+                    if s:
+                        items.append(s)
             if items:
                 return items
+    return None
+
+
+def _after_prefix(text: str, answer_prefix: str) -> str | None:
+    """Text following the LAST occurrence of `answer_prefix` that has content."""
+    key = answer_prefix.strip().rstrip(":").strip()
+    if not key:
+        return None
+    low_text, low_key = text.lower(), key.lower()
+    idx = low_text.rfind(low_key)
+    while idx >= 0:
+        after = text[idx + len(low_key) :].lstrip(" :\t\n")
+        if after.strip():
+            return after
+        # The model merely MENTIONED the cue with nothing after it ("I cannot find
+        # the Final Answer"). Fall back to an earlier occurrence rather than
+        # abandoning the prefix logic and scoring the whole reply.
+        idx = low_text.rfind(low_key, 0, idx)
     return None
 
 
@@ -80,46 +129,58 @@ def extract_answers(
     answer_prefix: str | None = None,
     expect_list: bool = False,
 ) -> list[str]:
-    """Normalise a raw prediction from EITHER arm into a list of answer strings.
+    """Parse a raw prediction from EITHER arm into LOFT's answer list.
 
-    Resolution order (LOFT's):
-      1. the last bracketed list that parses as a Python literal;
-      2. the text after `answer_prefix` (e.g. "Final Answer:"), first line only;
-      3. the whole cleaned string.
+    Resolution order:
+      1. text after `answer_prefix` (the cue LOFT asks both arms to emit);
+      2. within that, a bracketed Python list when `expect_list` (multi-value);
+      3. otherwise the first line of the cued text.
 
-    Returns [] for an empty/None prediction — the caller scores that as 0.0.
-    `expect_list` only affects step 2: multi-value tasks keep the full remainder
-    (it may contain a comma list), single-value tasks stop at the first newline.
+    The list parse is gated on `expect_list` and runs only on cued text. Running it
+    unconditionally meant any stray bracket hijacked the answer — a citation marker
+    turned "Final Answer: Paris [1]" into ["1"], scoring a correct answer 0.0.
+
+    KNOWN LENIENCY, deliberately kept: when no cue is present the WHOLE reply is
+    treated as the answer, so a model that merely quotes retrieved text containing
+    the gold can score under subspan-EM containment. Rejecting uncued replies was
+    tried and is worse: the RLM's native answer is `str(FINAL(x))`, which carries no
+    cue, so strictness zeroed correct RLM answers while cued vanilla prose passed —
+    a larger asymmetry than the one it removed. The real fix is on the generation
+    side, where both arms now receive the same `answer_format` contract.
+
+    Returns [] for an empty/None prediction; the caller scores that as 0.0.
     """
     text = strip_reasoning(prediction)
     if not text:
         return []
 
-    items = _parse_list(text)
-    if items is not None:
-        return items
+    cued = _after_prefix(text, answer_prefix) if answer_prefix else None
+    body = cued if cued is not None else text
 
-    if answer_prefix:
-        key = answer_prefix.strip().rstrip(":").strip().lower()
-        idx = text.lower().rfind(key.lower())
-        if key and idx >= 0:
-            after = text[idx + len(key) :].lstrip(" :\t\n")
-            if after.strip():
-                text = after if expect_list else after.split("\n", 1)[0]
+    if expect_list:
+        items = _parse_list(body)
+        if items is not None:
+            return items
 
-    text = text.strip()
-    if not text:
+    if cued is not None:
+        body = body.split("\n", 1)[0] if not expect_list else body
+    body = body.strip()
+    if not body:
         return []
-    if expect_list and "," in text and "\n" not in text:
-        parts = [p.strip() for p in text.split(",") if p.strip()]
-        if len(parts) > 1:
-            return parts
-    return [text]
 
+    if expect_list:
+        # An enumerated or comma-joined answer is the natural PROSE form of a list;
+        # without this, only the RLM's str(FINAL([...])) would ever parse and the
+        # extraction step would itself become an arm asymmetry.
+        lines = [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", ln).strip()
+                 for ln in body.split("\n")]
+        lines = [ln for ln in lines if ln]
+        if len(lines) > 1:
+            return lines
+        if len(lines) == 1 and "," in lines[0]:
+            parts = [p.strip() for p in lines[0].split(",") if p.strip()]
+            if len(parts) > 1:
+                return parts
+        body = lines[0] if lines else body
 
-def extract_answer(
-    prediction: str | None, *, answer_prefix: str | None = None
-) -> str:
-    """Single-string form of `extract_answers`, for scalar-answer metrics."""
-    items = extract_answers(prediction, answer_prefix=answer_prefix)
-    return items[0] if items else ""
+    return [body] if body else []

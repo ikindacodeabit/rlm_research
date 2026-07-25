@@ -210,8 +210,17 @@ def loft_scores(
         ]
         subspan = 1.0 if _kuhn_matching(adj, len(preds)) == len(golds) else 0.0
         em = float(set(golds) == set(preds))                 # compute_em_multi_value
-        coverage = len(set(preds) & set(golds)) / len(golds)  # compute_coverage
-        f1 = max(_f1(p.split(), g.split()) for g in golds for p in preds)
+        # compute_coverage: containment-based, to agree with subspan above. Exact set
+        # intersection would report 0.0 for gold "alpha" vs pred "alpha smith" while
+        # subspan reported 1.0 -- two secondaries disagreeing inside one call.
+        coverage = sum(
+            1 for g in golds if any(g in p or p in g for p in preds)
+        ) / len(golds)
+        # Per-gold best match, AVERAGED. A max over the gold x pred cross product
+        # let one lucky prediction saturate F1 while every other gold was missed,
+        # which would silently mislead anyone promoting f1 to the headline.
+        f1 = sum(max(_f1(p.split(), g.split()) for p in preds)
+                 for g in golds) / len(golds)
     else:
         # utils.compute_subspan_em / compute_em / compute_f1, each max over golds,
         # against the single extracted prediction.
@@ -263,6 +272,11 @@ _METRIC_FN = {
 # metric name to the key of the primary number. `recall` is handled by the caller
 # (benchmarks/run_benchmark.py) because it predates this module.
 _LOFT_PRIMARY = {"loft_subspan_em": "subspan_em"}
+
+# Metrics whose OFFICIAL evaluation includes parsing the model output into an
+# answer list before scoring. Only these get benchmarks.answer_extraction applied;
+# LongBench/RULER score the raw generation (see run_benchmark.score_record).
+LOFT_METRICS = frozenset(_LOFT_PRIMARY)
 
 # Metrics whose score==1.0 genuinely means "exactly right", so a boolean `correct`
 # is meaningful. For F1/ROUGE/code_sim a 1.0 is a continuous score that happened to

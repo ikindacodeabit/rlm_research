@@ -14,3 +14,7 @@ results/
 
 # local-only results explorer website (never commit it)
 rlm-results-site/
+
+# archived results trees (see scripts/archive_results.sh)
+archive/
+*.jsonl.bak

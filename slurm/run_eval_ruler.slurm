@@ -10,6 +10,11 @@
 #SBATCH --output=logs/rlm-ruler.%J.out
 #SBATCH --error=logs/rlm-ruler.%J.err
 
+# NOTE: superseded by slurm/run_eval_task.slurm, which runs every task with
+# IDENTICAL flags (this script's --vanilla-char-limit / results-dir naming differ
+# from its siblings, which confounds cross-dataset comparison). Kept for
+# reproducing earlier runs; use the unified driver for new campaigns.
+
 # RULER-32k: base RLM (unbounded) + vanilla, thinking on/off, over ALL ~13
 # RULER subsets in one task. The ruler32k loader samples PER SUBSET (--limit is
 # per-subset), and run_benchmark tags each record with its `subset`, so score.py

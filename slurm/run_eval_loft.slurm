@@ -10,6 +10,11 @@
 #SBATCH --output=logs/rlm-loft.%J.out
 #SBATCH --error=logs/rlm-loft.%J.err
 
+# NOTE: superseded by slurm/run_eval_task.slurm, which runs every task with
+# IDENTICAL flags (this script's --vanilla-char-limit / results-dir naming differ
+# from its siblings, which confounds cross-dataset comparison). Kept for
+# reproducing earlier runs; use the unified driver for new campaigns.
+
 # LOFT (Long-Context Frontiers) RAG: base RLM (unbounded) + vanilla, thinking
 # on/off, over the 5 subsets of ONE context length. The loft loader samples PER
 # SUBSET (--limit is per-subset) and tags each record with its `subset`, so

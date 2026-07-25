@@ -104,13 +104,22 @@ def main() -> None:
             print(f"[skip] {path}: unexpected filename", file=sys.stderr)
             continue
 
-        out_lines, changed_here = [], 0
+        out_lines, changed_here, fields_changed = [], 0, 0
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
-            rec = json.loads(line)
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as e:
+                # A truncated final line is routine after a killed slurm job. Keep it
+                # verbatim rather than aborting mid-tree with files already rewritten.
+                print(f"[skip] {path}: unparseable line: {e}", file=sys.stderr)
+                skipped["unparseable line (truncated file?)"] += 1
+                out_lines.append(line)
+                continue
             old_score = rec.get("score")
             old_metric = rec.get("metric")
+            old_correct = rec.get("correct")
             ex = backfill(rec)
             if not ex["metric"]:
                 out_lines.append(line)
@@ -143,12 +152,21 @@ def main() -> None:
             c[4].add(metric)
             if old_score is None or abs(float(old_score) - rec["score"]) > 1e-9:
                 changed_here += 1
+            if rec["correct"] != old_correct:
+                # `correct` must be rewritten even when the score is unchanged. It
+                # previously wasn't, leaving stale `correct: true` on qa_f1/rouge rows
+                # in every file where no score happened to move -- the same field
+                # meaning different things in different files.
+                fields_changed += 1
             out_lines.append(json.dumps(rec))
 
         n_changed += changed_here
-        if not args.dry_run and changed_here:
-            if not args.no_backup:
-                shutil.copy2(path, path.with_suffix(".jsonl.bak"))
+        if not args.dry_run and (changed_here or fields_changed):
+            bak = path.with_suffix(".jsonl.bak")
+            # Write-once: a second rescore must not overwrite the pristine originals
+            # with an already-rescored copy.
+            if not args.no_backup and not bak.exists():
+                shutil.copy2(path, bak)
             path.write_text("\n".join(out_lines) + "\n")
 
     hdr = (f"{'task':<14}{'variant':<20}{'mode':<9}{'subset':<22}"

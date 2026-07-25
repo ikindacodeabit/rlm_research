@@ -10,6 +10,11 @@
 #SBATCH --output=logs/rlm-local.%J.out
 #SBATCH --error=logs/rlm-local.%J.err
 
+# NOTE: superseded by slurm/run_eval_task.slurm, which runs every task with
+# IDENTICAL flags (this script's --vanilla-char-limit / results-dir naming differ
+# from its siblings, which confounds cross-dataset comparison). Kept for
+# reproducing earlier runs; use the unified driver for new campaigns.
+
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs results

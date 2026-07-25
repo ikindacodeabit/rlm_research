@@ -94,21 +94,102 @@ def test_loft_edge_cases() -> None:
 # 2. Answer extraction — the shared layer, LOFT's parsing rules
 # --------------------------------------------------------------------------- #
 def test_extraction() -> None:
-    check("extract/list", extract_answers("Final Answer: ['Koh Phi Phi']"), ["Koh Phi Phi"])
-    check("extract/multi list", extract_answers("Final Answer: ['a', 'b']"), ["a", "b"])
-    # a restated format template must not win over the real answer
-    check("extract/last list wins",
-          extract_answers("use ['answer1', 'answer2']\nFinal Answer: ['Real']"), ["Real"])
+    """LOFT answer parsing. Note extraction is LOFT-only -- see score_record."""
+    P = "Final Answer:"
+    # list parsing is gated on expect_list (multi-value tasks)
+    check("extract/list", extract_answers("Final Answer: ['a','b']", answer_prefix=P,
+                                          expect_list=True), ["a", "b"])
     check("extract/after prefix",
-          extract_answers("blah\nFinal Answer: Paris\ntrailing", answer_prefix="Final Answer:"),
-          ["Paris"])
+          extract_answers("blah\nFinal Answer: Paris\ntrailing", answer_prefix=P), ["Paris"])
     check("extract/no cue -> whole string",
           extract_answers("Paris is the answer"), ["Paris is the answer"])
     check("extract/empty", extract_answers(""), [])
     check("extract/none", extract_answers(None), [])
-    check("extract/think block", extract_answers("<think>maybe X</think>Final Answer: ['Y']"), ["Y"])
-    check("extract/dangling think", strip_reasoning("leaked</think> answer"), "answer")
-    check("extract/no think is noop", strip_reasoning("plain answer"), "plain answer")
+    check("extract/think block",
+          extract_answers("<think>maybe X</think>Final Answer: Y", answer_prefix=P), ["Y"])
+
+    # REGRESSION: a stray bracket used to hijack the answer. "Final Answer: Paris [1]"
+    # parsed to ['1'] and scored a CORRECT answer 0.0.
+    check("regress/citation marker not a list",
+          extract_answers("Final Answer: Paris [1]", answer_prefix=P), ["Paris [1]"])
+    check("regress/subscript not a list",
+          extract_answers("Final Answer: data[3]", answer_prefix=P), ["data[3]"])
+
+    # REGRESSION: the scan took the LAST/innermost list, dropping half a nested one.
+    check("regress/nested list flattened",
+          extract_answers('Final Answer: [["a","b"],["c","d"]]', answer_prefix=P,
+                          expect_list=True), ["a", "b", "c", "d"])
+    # REGRESSION: a bracket inside a quoted string broke the depth counter.
+    check("regress/bracket inside string",
+          extract_answers('Final Answer: ["a [ b", "c"]', answer_prefix=P,
+                          expect_list=True), ["a [ b", "c"])
+
+    # REGRESSION: prose list forms must parse, or only the RLM's str(FINAL([...]))
+    # would ever match and extraction would itself become an arm asymmetry.
+    check("regress/numbered prose list",
+          extract_answers("Final Answer:\n1. Washington, D.C.\n2. Paris",
+                          answer_prefix=P, expect_list=True), ["Washington, D.C.", "Paris"])
+    check("regress/bulleted prose list",
+          extract_answers("Final Answer:\n- alpha\n- beta", answer_prefix=P,
+                          expect_list=True), ["alpha", "beta"])
+
+    # REGRESSION: a trailing MENTION of the cue with nothing after it used to abandon
+    # the prefix logic entirely and score the whole reply.
+    check("regress/cue mentioned last falls back",
+          extract_answers("Final Answer: Paris\nI cannot find the Final Answer",
+                          answer_prefix=P), ["Paris"])
+
+
+def test_strip_reasoning() -> None:
+    check("think/well formed", strip_reasoning("<think>x</think>real"), "real")
+    check("think/no think is noop", strip_reasoning("plain answer"), "plain answer")
+    check("think/dangling close", strip_reasoning("leaked</think> answer"), "answer")
+    # REGRESSION: an UNCLOSED block (generation cut off at max_tokens) was left in
+    # place and scored as the answer, despite the comment claiming otherwise.
+    check("regress/unclosed think", strip_reasoning("<think>abc"), "")
+    check("regress/answer then unclosed", strip_reasoning("answer\n<think>oops"), "answer")
+    check("regress/two closers", strip_reasoning("A</think> mid </think> B"), "B")
+
+
+def test_loft_secondaries() -> None:
+    """REGRESSION: the stored secondaries must not contradict the primary."""
+    # coverage was exact set intersection while subspan used containment, so the two
+    # disagreed inside a single call.
+    r = loft_scores(["alpha"], ["alpha smith"], multi_value=True)
+    check("regress/coverage is containment", r["coverage"], 1.0)
+    check("regress/coverage agrees with subspan", r["subspan_em"], 1.0)
+    # f1 was a max over the gold x pred cross product, so one lucky pred saturated it
+    # while every other gold was missed.
+    r2 = loft_scores(["alpha", "beta"], ["zzz", "alpha"], multi_value=True)
+    check("regress/f1 does not saturate", r2["f1"], 0.5)
+    check("regress/f1 consistent with coverage", r2["coverage"], 0.5)
+
+
+def test_extraction_is_loft_only() -> None:
+    """Pins the fidelity-vs-parity split (see score_record's docstring).
+
+    LongBench/RULER metrics are defined over the RAW generation, so score_record
+    must NOT run answer extraction for them; parity for those is handled by the
+    answer_format contract both arms receive. Only LOFT parses, because parsing is
+    part of LOFT's own official evaluation.
+    """
+    from benchmarks.datasets import METRIC_ANSWER_FORMAT
+
+    # LOFT: the list wrapper is parsed away, so both answer shapes score alike.
+    loft = {"id": "l", "metric": "loft_subspan_em", "multi_value": True,
+            "answer_prefix": "Final Answer:", "answers": ["alpha", "beta"]}
+    check("loft parses list", score_record(loft, "Final Answer: ['alpha','beta']")[1], 1.0)
+    check("loft parses bare list", score_record(loft, "['alpha', 'beta']")[1], 1.0)
+
+    # Non-LOFT: scored on the raw text, matching upstream.
+    lb = {"id": "b", "metric": "qa_f1", "subset": "qasper", "answers": ["Paris"]}
+    check("longbench scores raw text", score_record(lb, "Paris")[1], 1.0)
+
+    # Every metric a loader can emit must have a format contract, so neither arm is
+    # asked for a shape the other was not.
+    for name in ("qa_f1", "rouge", "classification", "count", "retrieval",
+                 "code_sim", "choice", "recall"):
+        check(f"answer_format/{name} exists", name in METRIC_ANSWER_FORMAT, True)
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +276,9 @@ def test_arm_parity() -> None:
     bare = score_record(ex, "['alpha', 'beta']")[1]
     check("parity prose vs bare list", prose, bare)
     check("parity both correct", prose, 1.0)
+    # The RLM's native answer carries no cue; requiring one scored it 0.0 while cued
+    # vanilla prose passed -- a larger asymmetry than the looseness it removed.
+    check("parity uncued RLM list still scores", bare, 1.0)
 
 
 def test_metric_registry() -> None:
@@ -228,7 +312,8 @@ def test_metric_registry() -> None:
 
 def main() -> None:
     for fn in (test_loft_single_value, test_loft_multi_value, test_loft_edge_cases,
-               test_extraction, test_longbench_metrics, test_recall,
+               test_loft_secondaries, test_extraction, test_strip_reasoning,
+               test_extraction_is_loft_only, test_longbench_metrics, test_recall,
                test_normalisation, test_arm_parity, test_metric_registry):
         fn()
         print(f"  ran {fn.__name__}")

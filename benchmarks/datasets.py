@@ -32,6 +32,32 @@ def _filler(rng: random.Random, n_chars: int) -> str:
     return " ".join(out)
 
 
+
+# --------------------------------------------------------------------------- #
+# Answer-format contracts
+# --------------------------------------------------------------------------- #
+# Both arms receive the SAME contract: vanilla_answer appends it to its prompt and
+# ROOT_SYSTEM_PROMPT states it as the required shape for FINAL(...). Without this,
+# vanilla emitted free prose while the RLM emitted str(FINAL(x)), and the official
+# raw-text metrics measured that style difference as if it were accuracy —
+# count/retrieval divide by the number of digit-runs in the prediction, ROUGE-L's
+# precision denominator penalises length, and code_sim reads only the first line.
+#
+# The QUESTION text is deliberately left untouched, so these runs stay comparable
+# to earlier ones and faithful to each benchmark's own prompt. This is purely an
+# additional, symmetric instruction.
+METRIC_ANSWER_FORMAT = {
+    "qa_f1": "the answer text only, with no explanation or preamble",
+    "rouge": "a concise summary only, with no preamble",
+    "classification": "the class label only, with no explanation",
+    "count": "the number only, with no other text",
+    "retrieval": "the paragraph reference only, in the form 'Paragraph N'",
+    "code_sim": "the single next line of code only, with no explanation or fences",
+    "choice": "a single letter: A, B, C or D, with no explanation",
+    "recall": "the answer only, with no explanation or preamble",
+}
+
+
 def gen_niah(n_examples: int = 50, ctx_chars: int = 200_000, seed: int = 0):
     """Single needle-in-a-haystack: retrieve a planted passkey."""
     rng = random.Random(seed)
@@ -44,6 +70,7 @@ def gen_niah(n_examples: int = 50, ctx_chars: int = 200_000, seed: int = 0):
         yield {
             "id": f"niah-{ctx_chars}-{i}",
             "metric": "recall",
+            "answer_format": METRIC_ANSWER_FORMAT["count"],
             "context": context,
             "question": "What is the secret passkey mentioned in the document? Reply with the number only.",
             "answers": [key],
@@ -62,6 +89,7 @@ def gen_multikey(n_examples: int = 50, ctx_chars: int = 200_000, n_keys: int = 8
         yield {
             "id": f"multikey-{ctx_chars}-{i}",
             "metric": "recall",
+            "answer_format": METRIC_ANSWER_FORMAT["count"],
             "context": body,
             "question": f"There are {n_keys} assets (Asset 0..{n_keys-1}), each with a value in credits. "
                         "What is the SUM of all asset values? Reply with the number only.",
@@ -98,6 +126,7 @@ def load_longbench_v2(limit: int | None = None):
                     "id": ex.get("_id", f"lb2-{i}"),
                     "subset": subset,
                     "metric": "choice",
+                    "answer_format": METRIC_ANSWER_FORMAT["choice"],
                     "context": ex["context"],
                     "question": f"{ex['question']}\n{choices}\nAnswer with the letter (A/B/C/D) only.",
                     "answers": [ex["answer"]],
@@ -158,6 +187,7 @@ def load_longbench(limit: int | None = None):
                     "id": ex.get("_id", f"{subset}-{k}"),
                     "subset": subset,
                     "metric": _longbench_metric(subset),
+                    "answer_format": METRIC_ANSWER_FORMAT[_longbench_metric(subset)],
                     "all_classes": ex.get("all_classes"),
                     "context": ex["context"],
                     "question": ex.get("input", "Answer the question based on the document above."),
@@ -183,6 +213,7 @@ def load_oolong(limit: int | None = None):
                 rec = {
                     "id": ex.get("id", f"oolong-{i}"),
                     "metric": "recall",
+                    "answer_format": METRIC_ANSWER_FORMAT["recall"],
                     "context": ex["context"],
                     "question": ex["question"],
                     "answers": ex["answers"] if isinstance(ex.get("answers"), list) else [str(ex.get("answer", ""))],
@@ -296,6 +327,7 @@ def _load_ruler(name: str, limit: int | None = None):
                 rec = {
                     "id": f"{name}-{subset}-{k}",
                     "metric": "recall",
+                    "answer_format": METRIC_ANSWER_FORMAT["recall"],
                     "subset": subset,
                     "context": ex["context"],
                     "question": q or "Answer the query stated in the document above. Reply with the answer only.",

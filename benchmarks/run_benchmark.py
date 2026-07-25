@@ -20,6 +20,7 @@ from benchmarks.answer_extraction import extract_answers, strip_reasoning
 from benchmarks.datasets import TASKS
 from benchmarks.longbench_metrics import (
     EXACT_MATCH_METRICS,
+    LOFT_METRICS,
     normalize_answer,
     score_example_all,
 )
@@ -48,10 +49,23 @@ def recall(pred: str | None, answers: list[str]) -> float:
 def score_record(ex: dict, pred: str | None) -> tuple[str, float, dict]:
     """Score one prediction. IDENTICAL for the vanilla and RLM arms.
 
-    This is the single scoring site in the harness. Both arms' raw output is put
-    through the same reasoning-strip + answer-extraction before any metric runs,
-    so a metric can never reward one arm's answer STYLE over the other's — see
-    benchmarks/answer_extraction for why that mattered.
+    This is the single scoring site in the harness: it takes no `mode` argument, so
+    the two arms cannot diverge here.
+
+    What is and is NOT normalised, and why:
+      * Reasoning blocks are stripped for every metric — a <think> trace is never
+        part of any benchmark's intended answer.
+      * ANSWER EXTRACTION runs only for LOFT, because parsing the model's output
+        into an answer list is part of LOFT's own official evaluation
+        (google-deepmind/loft). LongBench v1/v2 and RULER define their metrics over
+        the RAW generation, so extracting there would diverge from the published
+        numbers.
+
+    That leaves the arms free to differ in answer STYLE on the raw-text metrics, so
+    parity for those is enforced on the GENERATION side instead: every loader
+    supplies an `answer_format` that both arms receive (see benchmarks/datasets.py,
+    rlm.vanilla_answer and ROOT_SYSTEM_PROMPT). Fidelity to the official metric and
+    fairness between arms are thus handled in the two places each belongs.
 
     Returns (metric_name, primary_score, secondary_scores).
     """
@@ -68,11 +82,15 @@ def score_record(ex: dict, pred: str | None) -> tuple[str, float, dict]:
     if metric == "recall":
         return metric, recall(clean, ex["answers"]), {}
 
-    pred_answers = extract_answers(
-        clean,
-        answer_prefix=ex.get("answer_prefix"),
-        expect_list=bool(ex.get("multi_value")),
-    )
+    # LOFT only — see the docstring. Parsing the output into an answer list is part
+    # of LOFT's own official evaluation; LongBench/RULER score the raw generation.
+    pred_answers = None
+    if metric in LOFT_METRICS:
+        pred_answers = extract_answers(
+            clean,
+            answer_prefix=ex.get("answer_prefix"),
+            expect_list=bool(ex.get("multi_value")),
+        )
     primary, secondary = score_example_all(
         metric, clean, ex["answers"],
         dataset=ex.get("subset"),
@@ -114,6 +132,14 @@ def main() -> None:
                     help="wall-clock seconds of PURE-PYTHON execution a single RLM code block "
                          "may run before being aborted (guards against model-generated infinite "
                          "loops); time spent inside llm_query sub-calls is excluded")
+    ap.add_argument("--run-timeout", type=float, default=900.0,
+                    help="wall-clock seconds for ONE example before the RLM gives up "
+                         "(end_reason=run_timeout). exec-timeout does not bound "
+                         "llm_query time, so without this a single pathological "
+                         "example can stall a job for hours. 0 disables")
+    ap.add_argument("--max-sub-calls", type=int, default=40,
+                    help="cap on llm_query calls per example; further calls return a "
+                         "notice instead of hitting the API. 0 disables")
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="max generation tokens per model call (root and sub). Unset uses the "
                          "client default (4096); raise it for Qwen3 'think' runs whose "
@@ -163,7 +189,9 @@ def main() -> None:
     if args.scratchpad:
         scratchpad = Scratchpad(max_notes_tokens=args.max_notes_tokens)
     rlm = RLM(root_client=root, sub_client=sub, max_steps=args.max_steps, budget=budget,
-              scratchpad=scratchpad, exec_timeout=args.exec_timeout)
+              scratchpad=scratchpad, exec_timeout=args.exec_timeout,
+              run_timeout=args.run_timeout or None,
+              max_sub_calls=args.max_sub_calls or None)
 
     for mode in modes:
         slug = args.root_model.replace("/", "_")

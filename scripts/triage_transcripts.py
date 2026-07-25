@@ -48,7 +48,10 @@ def _example_from(d: dict, task: str, subset: str) -> dict:
     ex = {"id": subset, "answers": d.get("answers") or [], "subset": subset,
           "metric": d.get("metric"), "all_classes": d.get("all_classes")}
     if not ex["metric"]:
-        ex["metric"] = "loft_subspan_em" if task.startswith("loft") else "recall"
+        # Do NOT invent a metric -- that is exactly the silent fallback removed from
+        # run_benchmark and datasets. Transcripts predating the `metric` field simply
+        # cannot be bucketed by score; the caller reports them separately.
+        return None
     if ex["metric"].startswith("loft"):
         ex["multi_value"] = subset.rsplit("_", 1)[0] in LOFT_MULTIVALUE
         ex["answer_prefix"] = "Final Answer:"
@@ -69,8 +72,11 @@ def classify(d: dict, task: str = "", subset: str = "") -> str:
     "the agent found it and the answer still did not score" (a reporting failure, OR
     a strict-metric artifact such as a gold span carrying a stray token).
     """
+    ex = _example_from(d, task, subset)
+    if ex is None:
+        return "unscoreable (transcript predates the `metric` field)"
     try:
-        _, score, _ = score_record(_example_from(d, task, subset), d.get("pred"))
+        _, score, _ = score_record(ex, d.get("pred"))
     except Exception:
         score = 0.0
     if score == 1.0:

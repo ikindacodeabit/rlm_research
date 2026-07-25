@@ -10,6 +10,11 @@
 #SBATCH --output=logs/rlm-nothink.%J.out
 #SBATCH --error=logs/rlm-nothink.%J.err
 
+# NOTE: superseded by slurm/run_eval_task.slurm, which runs every task with
+# IDENTICAL flags (this script's --vanilla-char-limit / results-dir naming differ
+# from its siblings, which confounds cross-dataset comparison). Kept for
+# reproducing earlier runs; use the unified driver for new campaigns.
+
 # Quick NO-THINK-ONLY pass: the fast half of run_eval_local.slurm's 2x2 grid.
 # Runs {niah, multikey, longbench_v2} x {vanilla, rlm} with Qwen3 thinking OFF,
 # into results/nothink/ — the SAME dir the full script uses for its nothink cells,

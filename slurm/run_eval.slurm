@@ -9,6 +9,22 @@
 #SBATCH --output=logs/rlm.%J.out
 #SBATCH --error=logs/rlm.%J.err
 
+
+# ============================== RETIRED ==============================
+# This is the old NIM-hosted script. It passes NO --root-model, so it silently
+# falls back to run_benchmark's argparse default (meta/llama-3.3-70b-instruct)
+# against https://integrate.api.nvidia.com/v1, with --max-steps 12 and
+# --vanilla-char-limit 400000, and writes into the BARE results/ root -- which
+# then pollutes every score.py table with a differently-configured model.
+#
+# Use the unified driver instead:
+#   sbatch --job-name=rlm-<task> --export=ALL,TASK=<task>,LIMIT=25 \
+#          slurm/run_eval_task.slurm
+# or scripts/submit_campaign.sh for the whole sweep.
+echo "slurm/run_eval.slurm is RETIRED -- use slurm/run_eval_task.slurm (see header)."
+exit 1
+# =====================================================================
+
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs results
