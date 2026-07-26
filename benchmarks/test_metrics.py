@@ -185,11 +185,20 @@ def test_extraction_is_loft_only() -> None:
     lb = {"id": "b", "metric": "qa_f1", "subset": "qasper", "answers": ["Paris"]}
     check("longbench scores raw text", score_record(lb, "Paris")[1], 1.0)
 
-    # Every metric a loader can emit must have a format contract, so neither arm is
-    # asked for a shape the other was not.
+    # Every metric has a format contract available...
     for name in ("qa_f1", "rouge", "classification", "count", "retrieval",
                  "code_sim", "choice", "recall"):
         check(f"answer_format/{name} exists", name in METRIC_ANSWER_FORMAT, True)
+
+    # ...but a loader must NOT attach one when its question already states the
+    # format. Stacking two instructions dropped niah nothink RLM 80.0% -> 38.0%:
+    # greedy decoding switched from a regex to relevant_text.split()[-1].
+    from benchmarks.datasets import TASKS
+    for task in ("niah", "multikey"):
+        ex = next(iter(TASKS[task](1)))
+        check(f"no stacked format/{task}", ex.get("answer_format"), None)
+        check(f"question carries format/{task}",
+              "only" in ex["question"].lower(), True)
 
 
 # --------------------------------------------------------------------------- #

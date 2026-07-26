@@ -46,6 +46,15 @@ def _filler(rng: random.Random, n_chars: int) -> str:
 # The QUESTION text is deliberately left untouched, so these runs stay comparable
 # to earlier ones and faithful to each benchmark's own prompt. This is purely an
 # additional, symmetric instruction.
+#
+# CRITICAL: only add it where the question does NOT already state the format.
+# Stacking two format instructions measurably degrades the RLM: on niah (whose
+# question already ends "Reply with the number only") adding "the number only,
+# with no other text" pushed a greedy-decoded Qwen3-8B from writing a regex to
+# writing `relevant_text.split()[-1]`, which grabs the last whitespace token of the
+# printed window. niah nothink RLM fell 80.0% -> 38.0% on identical examples.
+# Parity is already satisfied for those tasks: the instruction is in the QUESTION,
+# which both arms receive.
 METRIC_ANSWER_FORMAT = {
     "qa_f1": "the answer text only, with no explanation or preamble",
     "rouge": "a concise summary only, with no preamble",
@@ -70,7 +79,7 @@ def gen_niah(n_examples: int = 50, ctx_chars: int = 200_000, seed: int = 0):
         yield {
             "id": f"niah-{ctx_chars}-{i}",
             "metric": "recall",
-            "answer_format": METRIC_ANSWER_FORMAT["count"],
+            # no answer_format: the question already ends "Reply with the number only"
             "context": context,
             "question": "What is the secret passkey mentioned in the document? Reply with the number only.",
             "answers": [key],
@@ -89,7 +98,7 @@ def gen_multikey(n_examples: int = 50, ctx_chars: int = 200_000, n_keys: int = 8
         yield {
             "id": f"multikey-{ctx_chars}-{i}",
             "metric": "recall",
-            "answer_format": METRIC_ANSWER_FORMAT["count"],
+            # no answer_format: the question already ends "Reply with the number only"
             "context": body,
             "question": f"There are {n_keys} assets (Asset 0..{n_keys-1}), each with a value in credits. "
                         "What is the SUM of all asset values? Reply with the number only.",
@@ -126,7 +135,8 @@ def load_longbench_v2(limit: int | None = None):
                     "id": ex.get("_id", f"lb2-{i}"),
                     "subset": subset,
                     "metric": "choice",
-                    "answer_format": METRIC_ANSWER_FORMAT["choice"],
+                    # no answer_format: the question already ends
+                    # "Answer with the letter (A/B/C/D) only."
                     "context": ex["context"],
                     "question": f"{ex['question']}\n{choices}\nAnswer with the letter (A/B/C/D) only.",
                     "answers": [ex["answer"]],
