@@ -103,6 +103,7 @@ for THINK in $THINK_CONDITIONS; do
       --run-timeout 900 \
       --max-sub-calls 40 \
       --vanilla-char-limit 100000 \
+      --vanilla-max-prompt-tokens 34000 \
       --out "$OUTDIR" \
       || echo "WARN: $TASK/$MODE/$THINK failed, continuing"
   done

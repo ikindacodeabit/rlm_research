@@ -145,6 +145,12 @@ def main() -> None:
                          "client default (4096); raise it for Qwen3 'think' runs whose "
                          "<think> reasoning shares this budget with the visible answer")
     ap.add_argument("--vanilla-char-limit", type=int, default=400_000)
+    ap.add_argument("--vanilla-max-prompt-tokens", type=int, default=None,
+                    help="hard TOKEN ceiling for the vanilla prompt; the char limit "
+                         "alone overflows the served window on densely-tokenising "
+                         "subsets (RULER cwe / niah_multikey_3), which the server "
+                         "rejects with a 400. Set to (max-model-len - max-tokens - "
+                         "margin), e.g. 34000 for a 40960 window")
     # --- RLM memory-budget knobs (no budget unless --max-context-tokens is set) ---
     # Eviction-only: out-of-budget turns are simply dropped (no notes/summarization).
     ap.add_argument("--max-context-tokens", type=int, default=None,
@@ -224,9 +230,11 @@ def main() -> None:
                     # their format instruction inside the question text already).
                     answer_format = ex.get("answer_format")
                     if mode == "vanilla":
-                        pred = vanilla_answer(root, ex["context"], ex["question"],
-                                              char_limit=args.vanilla_char_limit,
-                                              answer_format=answer_format)
+                        pred = vanilla_answer(
+                            root, ex["context"], ex["question"],
+                            char_limit=args.vanilla_char_limit,
+                            answer_format=answer_format,
+                            max_prompt_tokens=args.vanilla_max_prompt_tokens)
                         record.update(pred=pred, steps=1, finished=True, end_reason="")
                     else:
                         r = rlm.run(ex["context"], ex["question"],

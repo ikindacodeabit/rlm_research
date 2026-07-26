@@ -861,6 +861,8 @@ class RLM:
 def vanilla_answer(
     client: NIMClient, context: str, task: str, char_limit: int = 400_000,
     answer_format: str | None = None,
+    max_prompt_tokens: int | None = None,
+    token_counter: Optional[Callable[[str], int]] = None,
 ) -> str:
     """Baseline: stuff (possibly truncated) context directly into the prompt.
 
@@ -872,8 +874,24 @@ def vanilla_answer(
     then measured that style difference as if it were accuracy.
     """
     truncated = context[:char_limit]
-    note = "" if len(context) <= char_limit else "\n[NOTE: document truncated]"
     fmt = f"\nFormat your answer as: {answer_format}" if answer_format else ""
-    prompt = (f"Document:\n{truncated}{note}\n\nTask: {task}\n"
-              f"Answer concisely.{fmt}")
+
+    def build(body: str) -> str:
+        note = "" if len(context) <= len(body) else "\n[NOTE: document truncated]"
+        return (f"Document:\n{body}{note}\n\nTask: {task}\n"
+                f"Answer concisely.{fmt}")
+
+    prompt = build(truncated)
+
+    # A CHARACTER limit is not a token limit. `--vanilla-char-limit 100000` assumes
+    # ~4 chars/token, but dense subsets tokenize far tighter -- RULER's `cwe`
+    # (repeated word lists) and `niah_multikey_3` (UUID-like keys) run ~2.5, so 100k
+    # chars is ~40k tokens and the server rejected EVERY request with a 400
+    # "maximum context length is 40960 tokens". Those cells scored 0.0 for vanilla
+    # from a harness error rather than from the model. Shrink until it really fits.
+    if max_prompt_tokens:
+        tok = TokenCounter(token_counter)
+        while tok.count(prompt) > max_prompt_tokens and len(truncated) > 2000:
+            truncated = truncated[: int(len(truncated) * 0.8)]
+            prompt = build(truncated)
     return client.chat([{"role": "user", "content": prompt}])
