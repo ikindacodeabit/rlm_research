@@ -21,7 +21,9 @@ def aggregate(results_dir: str):
     rows = defaultdict(lambda: {"n": 0, "score": 0.0, "tokens": 0, "latency": 0.0,
                                 "unfinished": 0, "errors": 0,
                                 "peak_sum": 0, "peak_n": 0, "budget": None,
-                                "abstain": 0})
+                                "abstain": 0,
+                                # Truncation exposure for the vanilla arm.
+                                "seen": 0, "seen_n": 0, "ctx_frac": 0.0, "ctx_n": 0})
     for path in sorted(Path(results_dir).rglob("*.jsonl")):
         variant = path.parent.name if path.parent != Path(results_dir) else "root"
         task, mode, model = path.stem.split(".", 2)
@@ -62,6 +64,19 @@ def aggregate(results_dir: str):
             # like-for-like comparison -- ~12% of RLM records abstain. Report it.
             row["abstain"] += r.get("pred") is None
             row["errors"] += "error" in r
+            # Truncation exposure. The vanilla arm is capped by --vanilla-char-limit,
+            # so on a context longer than the cap its score is bounded by how often
+            # the answer survived the cut -- measured at 47.1% for niah, which is
+            # EXACTLY what vanilla scored. A score column alone reports that ceiling
+            # as model accuracy. `seen%` is over records whose gold is quoted in the
+            # context at all; `ctx%` covers the rest (derived answers like multikey's
+            # sum, which is never present at any length).
+            if r.get("gold_visible") is not None:
+                row["seen_n"] += 1
+                row["seen"] += bool(r["gold_visible"])
+            if r.get("context_chars"):
+                row["ctx_n"] += 1
+                row["ctx_frac"] += r.get("context_chars_used", 0) / r["context_chars"]
             # budget / peak-context come from the RLM metrics dict (absent for vanilla)
             metrics = r.get("metrics") or {}
             if metrics.get("budget") is not None:
@@ -85,6 +100,7 @@ def main() -> None:
     # value, not an accuracy, and calling it accuracy propagated into every plot.
     hdr = (f"{'task':<14}{'subset':<22}{'variant':<16}{'mode':<9}{'model':<34}"
            f"{'metric':<16}{'budget':>8}{'n':>5}{'score%':>8}{'abst%':>7}"
+           f"{'seen%':>7}{'ctx%':>6}"
            f"{'tok/q':>9}{'s/q':>7}{'peakctx':>9}{'unfin':>7}{'err':>5}")
     print(hdr)
     print("-" * len(hdr))
@@ -97,14 +113,24 @@ def main() -> None:
         abstain = 100 * r["abstain"] / n
         tok_q = r["tokens"] // n
         s_q = r["latency"] / n
+        # seen% is the vanilla arm's CEILING: it cannot beat the rate at which the
+        # gold survived truncation. Blank for the RLM (it reads the whole context)
+        # and for derived answers, where ctx% is the signal instead.
+        seen = 100 * r["seen"] / r["seen_n"] if r["seen_n"] else None
+        ctxp = 100 * r["ctx_frac"] / r["ctx_n"] if r["ctx_n"] else None
+        seen_s = f"{seen:.1f}" if seen is not None else ""
+        ctx_s = f"{ctxp:.0f}" if ctxp is not None else ""
         print(f"{task:<14}{subset:<22}{variant:<16}{mode:<9}{model:<34}"
               f"{metric:<16}{str(budget):>8}{r['n']:>5}{acc:>8.1f}{abstain:>7.1f}"
+              f"{seen_s:>7}{ctx_s:>6}"
               f"{tok_q:>9}{s_q:>7.1f}{str(peak):>9}{r['unfinished']:>7}{r['errors']:>5}")
         csv_rows.append({
             "task": task, "subset": subset, "variant": variant, "mode": mode,
             "model": model, "metric": metric, "budget": budget, "n": r["n"],
             "score": round(acc, 1), "acc": round(acc, 1),
             "abstain_pct": round(abstain, 1),
+            "gold_seen_pct": round(seen, 1) if seen is not None else "",
+            "ctx_kept_pct": round(ctxp, 1) if ctxp is not None else "",
             "tok_per_q": tok_q, "s_per_q": round(s_q, 1), "peak_ctx": peak,
             "finished": r["n"] - r["unfinished"], "unfin": r["unfinished"],
             "err": r["errors"],
@@ -114,7 +140,7 @@ def main() -> None:
         # `acc` is kept as an alias of `score` so results/plot_budget.py and any
         # existing CSV consumer keep working after the rename.
         fields = ["task", "subset", "variant", "mode", "model", "metric", "budget",
-                  "n", "score", "acc", "abstain_pct",
+                  "n", "score", "acc", "abstain_pct", "gold_seen_pct", "ctx_kept_pct",
                   "tok_per_q", "s_per_q", "peak_ctx", "finished", "unfin", "err"]
         with open(args.csv, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)

@@ -46,6 +46,26 @@ def recall(pred: str | None, answers: list[str]) -> float:
     return hits / len(answers)
 
 
+def _gold_visible(ex: dict, stats: dict) -> bool | None:
+    """Did the gold survive the vanilla arm's truncation?
+
+    None means "not applicable": the answer is DERIVED rather than quoted, so it
+    never appears in the context at any length (a summary, or `multikey`'s sum of
+    eight planted values). Reporting False there would read as a truncation failure
+    when the string was never present to begin with. For those tasks the retained-
+    context fraction (`context_chars_used / context_chars`) is the honest signal.
+    """
+    used = stats.get("context_chars_used")
+    if used is None:
+        return None
+    full = ex.get("context") or ""
+    golds = [str(a) for a in (ex.get("answers") or []) if str(a)]
+    present = [g for g in golds if g in full]
+    if not present:
+        return None
+    return any(g in full[:used] for g in present)
+
+
 def score_record(ex: dict, pred: str | None) -> tuple[str, float, dict]:
     """Score one prediction. IDENTICAL for the vanilla and RLM arms.
 
@@ -230,12 +250,20 @@ def main() -> None:
                     # their format instruction inside the question text already).
                     answer_format = ex.get("answer_format")
                     if mode == "vanilla":
+                        vstats: dict = {}
                         pred = vanilla_answer(
                             root, ex["context"], ex["question"],
                             char_limit=args.vanilla_char_limit,
                             answer_format=answer_format,
-                            max_prompt_tokens=args.vanilla_max_prompt_tokens)
+                            max_prompt_tokens=args.vanilla_max_prompt_tokens,
+                            stats=vstats)
                         record.update(pred=pred, steps=1, finished=True, end_reason="")
+                        # Was the gold even inside the prompt we sent? Without this a
+                        # truncated vanilla arm's score is indistinguishable from a
+                        # model failure -- niah vanilla scored 47.1%, which is EXACTLY
+                        # the 153/325 rate at which the needle survived the 100k cut.
+                        record.update(vstats)
+                        record["gold_visible"] = _gold_visible(ex, vstats)
                     else:
                         r = rlm.run(ex["context"], ex["question"],
                                     answer_format=answer_format)

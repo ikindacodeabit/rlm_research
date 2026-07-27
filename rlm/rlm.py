@@ -863,6 +863,7 @@ def vanilla_answer(
     answer_format: str | None = None,
     max_prompt_tokens: int | None = None,
     token_counter: Optional[Callable[[str], int]] = None,
+    stats: dict | None = None,
 ) -> str:
     """Baseline: stuff (possibly truncated) context directly into the prompt.
 
@@ -872,6 +873,11 @@ def vanilla_answer(
     the other was never asked for. Without it this prompt said only "Answer
     concisely", while the RLM answered via `str(FINAL(x))`; string-matching metrics
     then measured that style difference as if it were accuracy.
+
+    `stats`, if given, is filled with how much context actually survived truncation.
+    The caller needs this to separate "the model got it wrong" from "the answer was
+    never in the prompt": on a 200k-char synthetic with a 100k limit, vanilla is
+    structurally capped and a bare score column reads that cap as model accuracy.
     """
     truncated = context[:char_limit]
     fmt = f"\nFormat your answer as: {answer_format}" if answer_format else ""
@@ -907,14 +913,25 @@ def vanilla_answer(
     # So treat the estimate as a first guess and let the SERVER be the authority:
     # shrink and retry whenever it rejects the prompt for length. This is tokenizer-
     # independent and cannot silently no-op.
-    for _ in range(12):
+    def record(retries: int) -> None:
+        if stats is not None:
+            stats.update(context_chars=len(context),
+                         context_chars_used=len(truncated),
+                         truncated=len(truncated) < len(context),
+                         shrink_retries=retries)
+
+    for attempt in range(12):
         try:
-            return client.chat([{"role": "user", "content": prompt}])
+            out = client.chat([{"role": "user", "content": prompt}])
+            record(attempt)
+            return out
         except Exception as e:  # noqa: BLE001 - narrowed by the guard below
             if not _is_context_overflow(e) or len(truncated) <= 2000:
+                record(attempt)
                 raise
             truncated = truncated[: int(len(truncated) * 0.8)]
             prompt = build(truncated)
+    record(12)
     return client.chat([{"role": "user", "content": prompt}])
 
 
