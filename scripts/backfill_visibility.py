@@ -83,6 +83,9 @@ def main() -> None:
     ap.add_argument("--char-limit", type=int, default=100_000,
                     help="the --vanilla-char-limit the run used (default 100000)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="recompute rows already stamped (needed when the "
+                         "gold_visible RULE changes, not just the data)")
     args = ap.parse_args()
 
     totals = defaultdict(int)
@@ -115,7 +118,7 @@ def main() -> None:
                 out.append(rec)
                 continue
             ex = by_id.get(rec.get("id"))
-            if ex is not None and "gold_visible" not in rec:
+            if ex is not None and (args.force or "gold_visible" not in rec):
                 full = len(ex.get("context") or "")
                 used = min(full, args.char_limit)
                 # NB: assumes no shrink retry fired. True for the synthetics (prose
