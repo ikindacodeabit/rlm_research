@@ -81,9 +81,20 @@ echo "vLLM up. task=$TASK limit=$LIMIT"
 # under two conditions in one dir would silently mix configurations.
 # Dir scheme is uniform: results/{task}_{think,nothink} for EVERY task.
 #
-# --vanilla-char-limit 100000 (~33k tok worst case) keeps the vanilla prompt inside
-# the 40960 window with headroom for --max-tokens. 120000 had none and risks vLLM
-# rejecting prompt+max_tokens > max-model-len.
+# --vanilla-char-limit is NOT a safety mechanism any more. It used to be: 100000
+# chars was a guess at "fits the 40960 window". That guess CRIPPLED the baseline.
+# RULER-32k contexts are ~152k chars = ~33k tokens, which fits the window with room
+# to spare, but the char cap fed vanilla only 66% of them. Measured consequence:
+# five RULER subsets scored EXACTLY their truncation ceiling -- niah_multikey_1 at
+# 52.0 against a 52.0 ceiling, i.e. correct on every example where the needle
+# survived the cut. The RLM's headline "+44" on that subset was the cap, not the
+# method.
+#
+# Since 1c09cb3 the server itself drives the shrink (retry on its own 400), so the
+# only real ceiling is --vanilla-max-prompt-tokens. Set the char limit high enough
+# that it never binds first and let the TOKEN budget decide, which is the honest
+# baseline: "as much document as the window holds".
+# 36000 = 40960 window - 4096 max_tokens, minus a small margin for chat overhead.
 for THINK in $THINK_CONDITIONS; do
   if [ "$THINK" = nothink ]; then THINK_FLAG="--no-think"; else THINK_FLAG=""; fi
   OUTDIR="results/${TASK}_${THINK}"
@@ -102,8 +113,8 @@ for THINK in $THINK_CONDITIONS; do
       --max-steps 50 \
       --run-timeout 900 \
       --max-sub-calls 40 \
-      --vanilla-char-limit 100000 \
-      --vanilla-max-prompt-tokens 34000 \
+      --vanilla-char-limit 400000 \
+      --vanilla-max-prompt-tokens 36000 \
       --out "$OUTDIR" \
       || echo "WARN: $TASK/$MODE/$THINK failed, continuing"
   done
