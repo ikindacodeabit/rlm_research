@@ -21,7 +21,7 @@ def aggregate(results_dir: str):
     rows = defaultdict(lambda: {"n": 0, "score": 0.0, "tokens": 0, "latency": 0.0,
                                 "unfinished": 0, "errors": 0,
                                 "peak_sum": 0, "peak_n": 0, "budget": None,
-                                "abstain": 0,
+                                "abstain": 0, "scored": 0,
                                 # Truncation exposure for the vanilla arm.
                                 "seen": 0, "seen_n": 0, "ctx_frac": 0.0, "ctx_n": 0})
     for path in sorted(Path(results_dir).rglob("*.jsonl")):
@@ -54,16 +54,27 @@ def aggregate(results_dir: str):
                     f"{path}: record {r.get('id')!r} has no `score` field. "
                     "Re-score it first: python scripts/rescore.py <results_dir>"
                 )
-            row["score"] += float(r["score"])
+            errored = "error" in r
+            row["errors"] += errored
             row["tokens"] += r.get("tokens", 0)
             row["latency"] += r.get("latency_s", 0)
             row["unfinished"] += not r.get("finished", True)
+            # An ERRORED record is not a wrong answer, it is a missing measurement:
+            # the request 400'd or the API threw, and the model never got to answer.
+            # Averaging its 0.0 into score% is the same mistake as scoring a truncated
+            # prompt -- RULER `cwe` vanilla read "0.0" from 25 records that never ran.
+            # Keep them out of both means and let `err` carry them.
+            if errored:
+                continue
+            row["scored"] += 1
+            row["score"] += float(r["score"])
             # Abstention: the RLM can return pred=None (max_steps / ungrounded_final /
             # run_timeout) and score a structural 0. Vanilla always emits something and
             # can pick up accidental partial credit, so a score column alone is not a
-            # like-for-like comparison -- ~12% of RLM records abstain. Report it.
+            # like-for-like comparison. Errors are excluded here too -- they also leave
+            # pred None, which made LongBench-v2 vanilla report "80% abstention" for an
+            # arm that structurally cannot abstain.
             row["abstain"] += r.get("pred") is None
-            row["errors"] += "error" in r
             # Truncation exposure. The vanilla arm is capped by --vanilla-char-limit,
             # so on a context longer than the cap its score is bounded by how often
             # the answer survived the cut -- measured at 47.1% for niah, which is
@@ -109,10 +120,15 @@ def main() -> None:
         n = r["n"] or 1
         budget = r["budget"] if r["budget"] is not None else ""
         peak = round(r["peak_sum"] / r["peak_n"]) if r["peak_n"] else ""
-        acc = 100 * r["score"] / n
-        abstain = 100 * r["abstain"] / n
-        tok_q = r["tokens"] // n
-        s_q = r["latency"] / n
+        # score%/abst% are over records that actually RAN; err is the rest.
+        sc = r["scored"]
+        acc = 100 * r["score"] / sc if sc else None
+        abstain = 100 * r["abstain"] / sc if sc else None
+        # tok/q and s/q over records that ran too: an errored record contributes
+        # 0 tokens and ~0.1s, which would drag the cost columns toward zero.
+        d = sc or n
+        tok_q = r["tokens"] // d
+        s_q = r["latency"] / d
         # seen% is the vanilla arm's CEILING: it cannot beat the rate at which the
         # gold survived truncation. Blank for the RLM (it reads the whole context)
         # and for derived answers, where ctx% is the signal instead.
@@ -120,15 +136,19 @@ def main() -> None:
         ctxp = 100 * r["ctx_frac"] / r["ctx_n"] if r["ctx_n"] else None
         seen_s = f"{seen:.1f}" if seen is not None else ""
         ctx_s = f"{ctxp:.0f}" if ctxp is not None else ""
+        acc_s = f"{acc:.1f}" if acc is not None else "n/a"
+        abst_s = f"{abstain:.1f}" if abstain is not None else ""
         print(f"{task:<14}{subset:<22}{variant:<16}{mode:<9}{model:<34}"
-              f"{metric:<16}{str(budget):>8}{r['n']:>5}{acc:>8.1f}{abstain:>7.1f}"
+              f"{metric:<16}{str(budget):>8}{r['n']:>5}{acc_s:>8}{abst_s:>7}"
               f"{seen_s:>7}{ctx_s:>6}"
               f"{tok_q:>9}{s_q:>7.1f}{str(peak):>9}{r['unfinished']:>7}{r['errors']:>5}")
         csv_rows.append({
             "task": task, "subset": subset, "variant": variant, "mode": mode,
             "model": model, "metric": metric, "budget": budget, "n": r["n"],
-            "score": round(acc, 1), "acc": round(acc, 1),
-            "abstain_pct": round(abstain, 1),
+            "score": round(acc, 1) if acc is not None else "",
+            "acc": round(acc, 1) if acc is not None else "",
+            "abstain_pct": round(abstain, 1) if abstain is not None else "",
+            "scored": sc,
             "gold_seen_pct": round(seen, 1) if seen is not None else "",
             "ctx_kept_pct": round(ctxp, 1) if ctxp is not None else "",
             "tok_per_q": tok_q, "s_per_q": round(s_q, 1), "peak_ctx": peak,
@@ -140,7 +160,7 @@ def main() -> None:
         # `acc` is kept as an alias of `score` so results/plot_budget.py and any
         # existing CSV consumer keep working after the rename.
         fields = ["task", "subset", "variant", "mode", "model", "metric", "budget",
-                  "n", "score", "acc", "abstain_pct", "gold_seen_pct", "ctx_kept_pct",
+                  "n", "scored", "score", "acc", "abstain_pct", "gold_seen_pct", "ctx_kept_pct",
                   "tok_per_q", "s_per_q", "peak_ctx", "finished", "unfin", "err"]
         with open(args.csv, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
