@@ -98,6 +98,44 @@ def test_truncation_note_survives_shrinking():
     print("  ran test_truncation_note_survives_shrinking")
 
 
+def test_seen_is_suppressed_for_label_and_ambient_golds():
+    """seen% must not claim vanilla saw an answer that is in every document.
+
+    LongBench-v2 `choice` golds are single letters, `count` golds bare numbers and
+    `classification` golds label words. Containment finds all three anywhere, so
+    every lbv2 cell reported seen% 100.0 while retaining 15-22% of the context --
+    a ceiling of 100% that meant nothing. Those report None; ctx% carries them.
+    """
+    from benchmarks.run_benchmark import _gold_visible
+    stats = {"context_chars_used": 100_000}
+    for metric, gold in (("choice", "B"), ("count", "5"),
+                         ("classification", "abbreviation")):
+        ex = {"metric": metric, "answers": [gold], "context": (gold + " ") * 40_000}
+        assert _gold_visible(ex, stats) is None, (metric, gold)
+    # ambient even without a label metric
+    assert _gold_visible({"metric": "qa_f1", "answers": ["the"],
+                          "context": "the " * 60_000}, stats) is None
+    # a distinctive span is still measured, on both sides of the cut
+    early = "z" * 50_000 + "0163724" + "z" * 150_000
+    late = "z" * 150_000 + "0163724" + "z" * 50_000
+    assert _gold_visible({"metric": "recall", "answers": ["0163724"],
+                          "context": early}, stats) is True
+    assert _gold_visible({"metric": "recall", "answers": ["0163724"],
+                          "context": late}, stats) is False
+    print("  ran test_seen_is_suppressed_for_label_and_ambient_golds")
+
+
+def test_niah_ceiling_is_the_measured_47_1_percent():
+    """The number that made this whole column necessary. Pin it."""
+    from benchmarks.datasets import gen_niah
+    from benchmarks.run_benchmark import _gold_visible
+    stats = {"context_chars_used": 100_000}
+    vis = [_gold_visible(dict(ex, metric="recall"), stats) for ex in gen_niah(325)]
+    pct = 100 * sum(v is True for v in vis) / len(vis)
+    assert abs(pct - 47.1) < 0.1, pct
+    print(f"  ran test_niah_ceiling_is_the_measured_47_1_percent ({pct:.1f}%)")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

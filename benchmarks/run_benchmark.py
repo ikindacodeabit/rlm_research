@@ -46,21 +46,41 @@ def recall(pred: str | None, answers: list[str]) -> float:
     return hits / len(answers)
 
 
+# Metrics whose gold is a LABEL, not a span quoted from the document: a letter
+# (choice), a bare number (count), a class name (classification). Containment finds
+# those in any text, so "the gold survived truncation" is trivially true and tells
+# you nothing -- every LongBench-v2 `choice` cell reported seen% 100.0 while the
+# vanilla arm was retaining only 15-22% of the context.
+_LABEL_METRICS = {"choice", "count", "classification"}
+
+# Above this many occurrences in the full context, a gold string is ambient rather
+# than located, so its presence in the retained prefix is not evidence of anything.
+_MAX_GOLD_OCCURRENCES = 10
+
+
 def _gold_visible(ex: dict, stats: dict) -> bool | None:
     """Did the gold survive the vanilla arm's truncation?
 
-    None means "not applicable": the answer is DERIVED rather than quoted, so it
-    never appears in the context at any length (a summary, or `multikey`'s sum of
-    eight planted values). Reporting False there would read as a truncation failure
-    when the string was never present to begin with. For those tasks the retained-
-    context fraction (`context_chars_used / context_chars`) is the honest signal.
+    None means "the question is not meaningful here", which happens two ways:
+
+    * The answer is DERIVED, not quoted -- a summary, or `multikey`'s sum of eight
+      planted values -- so it appears at no length. False would read as a truncation
+      failure when the string was never present to begin with.
+    * The answer is a LABEL or otherwise ambient in the text, so containment is
+      trivially satisfied and True would overstate what vanilla could see.
+
+    In both cases the retained-context fraction is the honest signal instead.
     """
     used = stats.get("context_chars_used")
     if used is None:
         return None
+    if (ex.get("metric") or "") in _LABEL_METRICS:
+        return None
     full = ex.get("context") or ""
-    golds = [str(a) for a in (ex.get("answers") or []) if str(a)]
-    present = [g for g in golds if g in full]
+    # Distinctive = present, and present in only a few places. A 7-digit passkey
+    # occurs once; "B" occurs on every page.
+    present = [g for g in (str(a) for a in (ex.get("answers") or [])) if g
+               and 0 < full.count(g) <= _MAX_GOLD_OCCURRENCES]
     if not present:
         return None
     return any(g in full[:used] for g in present)
