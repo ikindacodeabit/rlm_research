@@ -163,7 +163,60 @@ def download_longbench_v2(out: Path):
           + ", ".join(f"{k}={v}" for k, v in sorted(domains.items())))
 
 
+def download_oolong(out: Path):
+    """OOLONG-synth: the benchmark the RLM paper leads with.
+
+    Why it matters here: every other task in this repo sits AT or BELOW the 40960-token
+    window we serve, so the vanilla arm sees the whole document and the RLM pays pure
+    overhead. OOLONG is aggregation over 128k+ tokens -- the regime the method actually
+    claims. The paper reports RLM(GPT-5-mini) ~114% over vanilla GPT-5 on trec_coarse
+    at 132k tokens, and OOLONG's own authors report every frontier model under 50% at
+    128k, so it is hard for both arms rather than trivially truncation-bound.
+
+    Schema (oolongbench/oolong-synth, split `test`): the context is
+    `context_window_text`, the query `question`, the gold `answer`, and `dataset`
+    names the sub-task (trec_coarse, ...). `context_len` is the token budget, kept in
+    the subset label so score.py breaks the comparison down BY LENGTH -- that scaling
+    curve is the actual claim being tested.
+    """
+    from datasets import load_dataset
+    print("Downloading OOLONG-synth ...")
+    ds = load_dataset("oolongbench/oolong-synth", split="test")
+    keep = os.environ.get("OOLONG_DATASETS", "trec_coarse").split(",")
+    lens = [int(x) for x in os.environ.get("OOLONG_LENS", "").split(",") if x.strip()]
+    counts: dict[str, int] = {}
+    with open(out, "w") as fout:
+        for i, ex in enumerate(ds):
+            sub = str(ex.get("dataset") or "?")
+            if keep and keep != [""] and sub not in keep:
+                continue
+            clen = int(ex.get("context_len") or 0)
+            if lens and clen not in lens:
+                continue
+            ctx = ex.get("context_window_text") or ""
+            ans = ex.get("answer")
+            if not ctx or ans is None:
+                continue
+            label = f"{sub}_{clen//1000}k" if clen else sub
+            counts[label] = counts.get(label, 0) + 1
+            fout.write(json.dumps({
+                "id": f"oolong-{sub}-{clen}-{ex.get('id', i)}",
+                "subset": label,
+                "context": ctx,
+                "question": ex.get("question", ""),
+                "answers": [str(ans)],
+            }) + "\n")
+    if not counts:
+        raise SystemExit(
+            "oolong: nothing matched. Set OOLONG_DATASETS (comma list, or empty for "
+            "all) and OOLONG_LENS to widen the filter."
+        )
+    print(f"  oolong: {sum(counts.values())} rows / {len(counts)} subsets: "
+          + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+
+
 JOBS = {
+    "oolong": ("oolong.jsonl", download_oolong),
     "ruler16k": ("ruler16k.jsonl", lambda out: _download_ruler(out, "ruler16k")),
     "ruler32k": ("ruler32k.jsonl", lambda out: _download_ruler(out, "ruler32k")),
     "longbench": ("longbench.jsonl", download_longbench),

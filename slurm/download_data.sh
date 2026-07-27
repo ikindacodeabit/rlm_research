@@ -23,13 +23,13 @@ source ~/venvs/rlm/bin/activate
 # run_eval_loft (~90 MB and ~350 MB of JSONL respectively; loft1m is ~2.8 GB and
 # is opt-in only). Override with DATASETS, e.g.
 #   DATASETS=ruler16k,longbench_v2 bash slurm/download_data.sh
-DATASETS="${DATASETS:-ruler16k,ruler32k,longbench,longbench_v2,loft32k,loft128k}"
+DATASETS="${DATASETS:-oolong,ruler16k,ruler32k,longbench,longbench_v2,loft32k,loft128k}"
 python scripts/download_data.py --only "$DATASETS"
 
-# --- OOLONG (still TODO) ---
-# The OOLONG splits' HF repo/config names have changed since release; add an
-# `oolong` job to scripts/download_data.py (writing oolong.jsonl with fields
-# {"id","context","question","answers":[...]}) once the exact loader is pinned.
-# See github.com/alexzhang13/rlm and https://huggingface.co/datasets?search=oolong.
+# --- OOLONG ---
+# Now implemented in scripts/download_data.py (oolongbench/oolong-synth, split
+# `test`). Defaults to the trec_coarse sub-task, all context lengths. Widen with:
+#   OOLONG_DATASETS= OOLONG_LENS=132000 DATASETS=oolong bash slurm/download_data.sh
+# (empty OOLONG_DATASETS = every sub-task; OOLONG_LENS filters by context_len).
 
 echo "Done. Data in $RLM_DATA_DIR"

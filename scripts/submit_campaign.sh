@@ -28,7 +28,11 @@ DRY=""
 #   longbench_v2  think/RLM at 19/25 on 3 of 6 domains
 #   ruler32k      complete except 100 vanilla records that 400'd; those retry now
 #                 that 1c09cb3 makes the prompt shrink until the server accepts
-TASKS="${TASKS:-longbench loft32k multikey niah longbench_v2 ruler32k}"
+#   oolong        the paper's OWN headline benchmark, never run here. RLM(GPT-5-mini)
+#                 reports ~114% over vanilla GPT-5 on trec_coarse at 132k tokens.
+#                 It is the only task in this list inside the regime the method
+#                 actually claims -- everything else is at or below the 40k window.
+TASKS="${TASKS:-oolong longbench loft32k multikey niah longbench_v2 ruler32k}"
 
 # --limit is PER SUBSET for every file-backed task, but a GLOBAL example count for
 # the synthetic generators. At a uniform limit niah would contribute 25 examples
@@ -45,6 +49,7 @@ limit_for() {
 data_for() {
   case "$1" in
     niah|multikey|niah-1m) echo "" ;;
+    oolong)                echo "oolong.jsonl" ;;
     ruler16k)              echo "ruler16k.jsonl" ;;
     ruler32k)              echo "ruler32k.jsonl" ;;
     longbench)             echo "longbench.jsonl" ;;

@@ -222,6 +222,12 @@ def load_oolong(limit: int | None = None):
                 ex = json.loads(line)
                 rec = {
                     "id": ex.get("id", f"oolong-{i}"),
+                    # `subset` carries the sub-task AND the context length
+                    # (trec_coarse_132k), so score.py breaks the comparison down by
+                    # length. That scaling curve is the claim being tested: the RLM
+                    # should pull ahead as the context passes the window, and this is
+                    # the only task here that goes past it.
+                    "subset": ex.get("subset"),
                     "metric": "recall",
                     "answer_format": METRIC_ANSWER_FORMAT["recall"],
                     "context": ex["context"],
