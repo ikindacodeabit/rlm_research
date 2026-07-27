@@ -94,6 +94,31 @@ def classify(d: dict, task: str = "", subset: str = "") -> str:
     return "never found gold"
 
 
+def load_record_fields(root: str, task: str) -> dict:
+    """id -> the loader-side fields the scorer needs, read from the results JSONL.
+
+    Transcripts store only {question, answers, pred, end_reason, metrics,
+    transcript}. Scoring also needs `metric`, and `all_classes` for classification
+    and `multi_value`/`answer_prefix` for LOFT. Those live in the JSONL that
+    run_benchmark writes alongside, under the same id.
+    """
+    want = ("metric", "subset", "all_classes", "multi_value", "answer_prefix")
+    out: dict[str, dict] = {}
+    for jf in Path(root).rglob(f"{task}.rlm.*.jsonl"):
+        for line in open(jf):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # partial last line from a killed job
+            rid = r.get("id")
+            if rid is not None:
+                out[str(rid)] = {k: r[k] for k in want if r.get(k) is not None}
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("task", help="task stem, e.g. loft32k (matches {task}.rlm.*)")
@@ -101,6 +126,9 @@ def main() -> None:
                     help="directory to search under (default: results)")
     ap.add_argument("--show", default=None,
                     help="print one full transcript from this bucket")
+    ap.add_argument("--subset", default=None,
+                    help="only this subset (e.g. trec). LongBench v1 has 16, and "
+                         "the aggregate hides which one is failing.")
     args = ap.parse_args()
 
     pattern = os.path.join(args.root, "**", "transcripts",
@@ -114,24 +142,43 @@ def main() -> None:
         sys.exit(f"no transcripts matched {pattern}\n"
                  f"try: find {args.root} -type d -name '{args.task}.rlm.*'")
 
+    # The transcript JSON never carried `metric` / `all_classes` / `subset`, so every
+    # LongBench transcript bucketed as "unscoreable" and the script was useless on the
+    # exact dataset it was needed for. The results JSONL beside it has all three, keyed
+    # by the same id -- join on that rather than guessing.
+    fields = load_record_fields(args.root, args.task)
+    if fields:
+        print(f"joined {len(fields)} records from the results JSONL for "
+              f"metric/subset/all_classes\n")
+
     buckets: Counter = Counter()
     per_subset: dict[str, Counter] = {}
     examples: dict[str, str] = {}
+    all_subsets: set[str] = set()   # every subset SEEN, so --subset can suggest
     for p in paths:
         try:
             d = json.load(open(p))
         except Exception as e:
             print(f"[skip] {p}: {e}", file=sys.stderr)
             continue
-        b = classify(d, args.task, Path(p).stem.rsplit("-", 1)[0])
+        rec = fields.get(Path(p).stem, {})
+        d = {**rec, **d}  # transcript wins on shared keys (pred/answers/end_reason)
+        # subset: prefer the recorded value, fall back to the id prefix
+        subset = rec.get("subset") or Path(p).stem.rsplit("-", 1)[0]
+        all_subsets.add(subset)
+        if args.subset and subset != args.subset:
+            continue
+        b = classify(d, args.task, subset)
         buckets[b] += 1
-        # subset is not stored in the transcript; recover it from the id/filename
-        subset = Path(p).stem.rsplit("-", 1)[0]
         per_subset.setdefault(subset, Counter())[b] += 1
         examples.setdefault(b, p)
 
     total = sum(buckets.values())
-    print(f"{total} transcripts under {args.root}\n")
+    if not total:
+        known = ", ".join(sorted(all_subsets)) or "none found"
+        sys.exit(f"no transcripts for subset {args.subset!r}; available: {known}")
+    where = f"{args.root}" + (f" (subset {args.subset})" if args.subset else "")
+    print(f"{total} transcripts under {where}\n")
     for b, n in buckets.most_common():
         print(f"{n:5d}  {100*n/total:5.1f}%  {b}")
         print(f"                e.g. {examples[b]}")

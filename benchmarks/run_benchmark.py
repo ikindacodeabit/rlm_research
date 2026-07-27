@@ -295,6 +295,15 @@ def main() -> None:
                             json.dump({"question": ex["question"],
                                        "answers": ex["answers"],
                                        "pred": r.answer,
+                                       # Scoring a transcript needs the loader-side
+                                       # fields too. Without them triage_transcripts
+                                       # bucketed every LongBench run as
+                                       # "unscoreable" and had to join the JSONL.
+                                       "metric": ex.get("metric"),
+                                       "subset": ex.get("subset"),
+                                       "all_classes": ex.get("all_classes"),
+                                       "multi_value": ex.get("multi_value"),
+                                       "answer_prefix": ex.get("answer_prefix"),
                                        "end_reason": r.end_reason,
                                        "metrics": r.metrics,
                                        "transcript": r.transcript}, tf, indent=2)
