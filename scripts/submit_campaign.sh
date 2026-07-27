@@ -16,7 +16,19 @@ cd "$(dirname "$0")/.."
 DRY=""
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
-TASKS="${TASKS:-niah multikey ruler32k longbench longbench_v2 loft32k}"
+# ORDER MATTERS: the QOS caps submitted jobs per user, so this list is the priority
+# in which slots get filled. Ordered by how much data is MISSING after the 2026-07-27
+# shutdown, biggest blank first -- every task resumes from its JSONL checkpoint, so
+# a task that is already complete costs one short job that skips every example.
+#
+#   longbench     14/16 RLM-nothink subsets + both think cells never ran
+#   loft32k       never submitted at all
+#   multikey      think/RLM at 65/325
+#   niah          think/RLM at 101/325
+#   longbench_v2  think/RLM at 19/25 on 3 of 6 domains
+#   ruler32k      complete except 100 vanilla records that 400'd; those retry now
+#                 that 1c09cb3 makes the prompt shrink until the server accepts
+TASKS="${TASKS:-longbench loft32k multikey niah longbench_v2 ruler32k}"
 
 # --limit is PER SUBSET for every file-backed task, but a GLOBAL example count for
 # the synthetic generators. At a uniform limit niah would contribute 25 examples
