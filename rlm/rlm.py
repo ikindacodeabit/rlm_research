@@ -894,4 +894,38 @@ def vanilla_answer(
         while tok.count(prompt) > max_prompt_tokens and len(truncated) > 2000:
             truncated = truncated[: int(len(truncated) * 0.8)]
             prompt = build(truncated)
+
+    # ...but the PREDICTIVE shrink above cannot be trusted on its own, because the
+    # counter is not the server's tokenizer. TokenCounter uses tiktoken cl100k_base
+    # when installed and `len // 4` when not -- and `len // 4` is exactly the 4
+    # chars/token assumption this whole block exists to escape, so on a box without
+    # tiktoken the loop is a silent no-op (100k chars // 4 = 25k < 34k, never
+    # shrinks). Even with tiktoken, cl100k and Qwen3's BPE disagree by well over the
+    # available headroom on the dense subsets. That is why cwe / niah_multikey_3 /
+    # LongBench-v2 "Long Structured Data" kept erroring at 100% AFTER the fix.
+    #
+    # So treat the estimate as a first guess and let the SERVER be the authority:
+    # shrink and retry whenever it rejects the prompt for length. This is tokenizer-
+    # independent and cannot silently no-op.
+    for _ in range(12):
+        try:
+            return client.chat([{"role": "user", "content": prompt}])
+        except Exception as e:  # noqa: BLE001 - narrowed by the guard below
+            if not _is_context_overflow(e) or len(truncated) <= 2000:
+                raise
+            truncated = truncated[: int(len(truncated) * 0.8)]
+            prompt = build(truncated)
     return client.chat([{"role": "user", "content": prompt}])
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """True for a 400 that means 'prompt too long', not some other bad request.
+
+    Matched on message text because the OpenAI client surfaces vLLM's error as a
+    generic BadRequestError; vLLM's wording is
+    "This model's maximum context length is 40960 tokens...".
+    """
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    msg = str(exc).lower()
+    return "context length" in msg or "context_length" in msg or "too long" in msg
